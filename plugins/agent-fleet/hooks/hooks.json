@@ -1,0 +1,18 @@
+{
+  "description": "Refuses Edit/Write into the main checkout while HEAD is on the default branch, so a fleet manager sitting there is structurally review-and-merge only. Work inside .claude/worktrees/ and files outside the repository are unaffected.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/guard-main-branch.js\"",
+            "timeout": 15,
+            "statusMessage": "Checking branch isolation..."
+          }
+        ]
+      }
+    ]
+  }
+}

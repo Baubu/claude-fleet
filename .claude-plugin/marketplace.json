@@ -1,0 +1,19 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "claude-fleet",
+  "description": "Personal marketplace: tooling for running parallel coding agents as a managed fleet.",
+  "owner": {
+    "name": "Baubu"
+  },
+  "plugins": [
+    {
+      "name": "agent-fleet",
+      "description": "Run parallel feature work as a fleet of Herdr agents: one git worktree per feature, one Claude agent per worktree, and a manager that reviews, sequences merges and files issues. Ships the manager CLI, a pre-merge review agent, and a PreToolUse guard that makes the manager structurally unable to edit feature code.",
+      "author": {
+        "name": "Baubu"
+      },
+      "source": "./plugins/agent-fleet",
+      "category": "development"
+    }
+  ]
+}
