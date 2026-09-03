@@ -46,10 +46,12 @@ Read `.result.workspace.workspace_id` and `.result.root_pane.pane_id` from the J
 Never guess IDs.
 
 A worktree holds **tracked files only**. Provision it before starting the agent:
-copy in whatever is gitignored but required (`.env`, credentials), and link
-dependencies rather than reinstalling them. On Windows use PowerShell
-`New-Item -ItemType Junction`; `mklink` through a bash tool gets its arguments
-mangled by MSYS path translation.
+copy in whatever is gitignored but required (`.env`, credentials), and give the
+lane its **own** dependency install — `npm ci`, `cargo fetch`, `uv sync`. Do not
+link or symlink a shared dependency tree; see "Isolation is weaker than it looks"
+below for why that fails in practice. Assert the install actually produced
+executables (`node_modules/.bin`, or the equivalent) before starting the agent, so
+a half-install fails loudly here instead of silently three lanes later.
 
 Then start the agent in the pane that `worktree create` returned:
 
@@ -108,17 +110,25 @@ everything that is not.
 - **`blocked` escalates to the human.** A blocked agent is sitting on a permission
   or question dialog. Read it and ask. A manager that auto-answers approval prompts
   on behalf of three other agents is a manager that approves something destructive.
-- **Merging to `main` is the human's gate.** Let the manager merge freely into an
-  integration branch and stage squashes, but require a person for `main`. Land
-  lanes one at a time, re-running checks after each, so a conflict has one obvious
-  author.
+- **Merge authority is the user's to set, and worth asking about once.** Default to
+  staging squashes and letting a person land `main`; if the user grants merge
+  rights, use them and land lanes one at a time, re-running checks after each, so a
+  conflict has one obvious author. Either way, keep a human gate on the genuinely
+  irreversible: applying migrations, reseeding live data, anything that changes what
+  users see. Say what the change will look like to a user before doing it.
 - **Prefer waiting to polling.** `herdr agent wait <name> --until blocked` and
   `--wait` on prompts are event-driven. A status loop on a short timer burns tokens
   across every lane at once for no new information.
 
-If the manager sits in the main checkout on `main`, a `PreToolUse` hook denying
-`Edit`/`Write` there makes the review-only role structural rather than advisory.
-This is worth setting up; see the project's own hook if it has one.
+This plugin ships a `PreToolUse` hook that denies `Edit`/`Write` in the main
+checkout while HEAD is on the repository's default branch, which makes the
+review-only role **structural rather than advisory** — the manager cannot write
+feature code even by mistake. It activates on install; a target repo needs no hook
+file and no settings entry of its own. Work inside `.claude/worktrees/` and files
+outside the repository are unaffected.
+
+When that guard blocks you, it is telling you the work belongs in a lane. Open one,
+or ask the user — do not look for an equivalent action it does not cover.
 
 ## Run it autonomously
 
@@ -145,11 +155,70 @@ naive `text=True` subprocess read crashes the watcher on the first Hebrew title.
 
 ### Choosing what to work on
 
-Rank open issues by three things, not one: **parallelism** (do the candidate issues
-touch disjoint files?), **difficulty** (a research issue and a refactor are very
-different lane lengths), and **dependency** (does one issue's output define
-another's input?). Prefer a set that is genuinely disjoint over the three
-highest-value issues — value you cannot land without conflicts is not value.
+Rank by **value first, then feasibility**. The failure mode is picking issues
+because they cannot collide — that optimises for the manager's convenience and
+fills lanes with low-value work while the thing the user actually cares about sits
+untouched. If the highest-value issue needs a clear field, give it one: run it
+alone rather than running three cheap issues around it.
+
+Score each candidate on:
+
+- **Value** — what the user has said matters, what a review or audit has flagged as
+  actually broken, what unblocks other work. Their stated priorities outrank your
+  sense of tidiness.
+- **Dependency** — does one issue's output define another's input? A scraper
+  rewrite that depends on an unmerged schema is not ready, however attractive.
+- **Parallelism** — do the candidates touch disjoint files? This is a *tiebreaker
+  among comparable issues*, not the primary axis.
+- **Shape** — a research issue, a refactor and a UI overhaul have very different
+  lane lengths. Mixing lengths is fine; mixing a repo-wide refactor with anything
+  else is not.
+
+Say out loud why you picked what you picked, and re-rank when the user pushes
+back — they can see value you cannot.
+
+### Keeping the fleet fed
+
+Lanes finish at different times, so the fleet drains unless something refills it.
+Three mechanisms, in order of how much they actually deliver:
+
+- **Event-driven refill (best).** `herd.sh watch` armed with the Monitor tool wakes
+  you when a lane settles; review it, land it, and launch the next issue in the
+  same turn. This keeps the fleet full while a session is alive.
+- **A local scheduled task** (cron, or Windows Task Scheduler) that starts a fresh
+  manager session on an interval. This is the only mechanism that survives the
+  session ending, because it can open a real terminal. Give it an explicit lane cap.
+- **A scheduled cloud agent** can work the *repository* on a schedule — claim an
+  issue, open a PR — but it **cannot drive a local multiplexer**: it has its own
+  sandbox and cannot see the machine. Do not promise a cloud routine will refill
+  local lanes. Coordinate it with the local fleet through a claim label on the
+  issue tracker so the two never pick the same issue.
+
+There is no API for "how much quota is left", so nothing can literally wait for a
+reset. An interval task fires and either works or fails cheaply.
+
+**The fleet multiplies token spend**, roughly linearly in lane count — that is the
+trade you make for wall-clock parallelism. If the account allows billable usage
+beyond its plan, an unattended refill loop is exactly the shape that runs into it.
+Cap the lanes, and say plainly what the fleet is costing when the user asks.
+
+### Verify what lanes tell you
+
+A lane agent's summary is evidence, not testimony. Re-run its checks yourself —
+it takes seconds and it occasionally catches a lane that reported success it did
+not have. More importantly, lanes reason from stale premises: one reported that it
+had corrupted a shared dependency tree, from documentation describing a design that
+had already been replaced; it had not. Another wrote that stale premise into shared
+project memory, where it would have misled every future session.
+
+So: **check a lane's factual claims against the repository before acting on them,
+and before repeating them to the user.** If lanes can write to shared memory or
+docs, audit what they wrote — a confidently-worded wrong memory outlives the lane
+that created it.
+
+Convergence is the opposite signal and worth acting on: when two lanes reach the
+same conclusion from different evidence, that is strong, and worth filing as a bug
+rather than a note.
 
 ### Reporting back
 
@@ -167,6 +236,22 @@ description of what the UI would look like.
 File follow-up issues for findings that are real but out of a lane's scope. When two
 lanes independently reach the same conclusion, that convergence is strong evidence
 and worth filing as a bug rather than a note.
+
+**Working through the issue tracker.** The tracker, not the terminal, is the fleet's
+shared state:
+
+- **Claim before working.** Add a label (`fleet:in-progress`) to an issue the moment
+  a lane takes it, and skip anything already claimed or already carrying an open PR.
+  This is what stops two lanes — or a local lane and a scheduled cloud agent — from
+  doing the same work twice. Release the claim if a lane fails.
+- **Close through the commit.** Have lanes end their commit message with the
+  tracker's closing keyword, so merging the PR closes the issue with no extra step.
+- **Record decisions where they survive.** Every "needs a human decision" item goes
+  in the PR body, not just the lane's pane. The pane is ephemeral; a reviewer coming
+  back tomorrow reads the PR.
+- **Sequence conflicting PRs explicitly.** When two lanes touch the same file, say in
+  both PR bodies which lands first and why, then rebase the second rather than
+  letting a merge queue guess.
 
 ## `idle` does not mean finished
 
@@ -220,6 +305,52 @@ archive that file alongside the pane read.
 Put the decisions in the PR body too. The archive is the backstop for everything
 that never makes it there.
 
+## Frictions worth knowing before they cost an hour
+
+Each of these was diagnosed the slow way once.
+
+**Tools glob into your worktrees.** Worktrees living inside the repo
+(`.claude/worktrees/`) are visible to every tool with a default include pattern.
+A test runner will collect each lane's test files and run them against the main
+checkout, where their mocks do not resolve — phantom failures with nothing wrong
+in either tree. Linters do the same. Exclude the worktree directory in every such
+config (`**/.claude/**`), and suspect this first when the main checkout fails
+tests that pass inside every lane.
+
+**Codegen is per-worktree.** Anything that generates into the dependency tree —
+ORM clients, protobuf, OpenAPI — must be re-run in each lane. A fresh worktree
+whose typecheck explodes with hundreds of missing-type errors usually needs the
+generator run, not debugging.
+
+**Line-ending churn breaks dirty checks.** On a repo with `core.autocrlf` and no
+`.gitattributes`, `git status --porcelain` reports files as modified with zero
+content change. That blocks rebases and makes every "is this tree clean?" gate
+unreliable. Use `git diff --numstat`, which compares content after normalisation,
+and fix the root cause with `* text=auto` in `.gitattributes`.
+
+**Decode subprocess output explicitly.** On Windows, Python defaults to the ANSI
+codepage, so reading multiplexer JSON crashes on the first non-ASCII agent title.
+Decode UTF-8 with a replacement policy.
+
+**Tear the lane down before deleting its branch.** A worktree holds a checkout of
+its branch, so `--delete-branch` on a merge fails while the lane exists. Recycle
+first, then delete.
+
+**CI may not fire on a push to an existing PR branch.** Where pushes authenticate
+with an automation token, the forge deliberately suppresses workflow triggers to
+avoid recursion — so a PR opened by CLI gets a run, but a later push to the same
+branch silently gets none, even though the PR head advanced. Check that a run
+actually exists rather than assuming; if it does not, your local verification is
+the evidence, and say so.
+
+**Permission rules match a whole command.** A rule allowing one command will not
+match it chained after another with `&&`. Run privileged commands standalone.
+
+**A safety layer denying an action is information, not an obstacle.** If a merge
+or a settings write is refused, do not reach for an equivalent that happens not to
+be covered — that defeats the purpose of the denial. Report what you were trying
+to do and let the user decide.
+
 ## Teardown
 
 ```bash
@@ -228,26 +359,24 @@ git branch -D <branch>                           # branch survives; remove it to
 git worktree prune                               # after any repo move or rename
 ```
 
-## Keeping the skill and the project copy in sync
+## Where the manager script lives
 
-`herd.sh` here and `<repo>/.claude/herd.sh` are kept **byte-identical**, so syncing
-is `cp` in either direction and drift is impossible. An earlier split — where the
-project copy hardcoded npm and the template carried a portability block — silently
-lost a bug fix that was only applied to one side. If you find yourself
-special-casing the project copy, push the behaviour behind `CHECK_CMD` in
-`.claude/fleet.conf` instead of forking the file.
+The plugin ships `scripts/herd.sh` and it is the **single source of truth**.
+`/fleet-init` copies it to `<repo>/.claude/herd.sh`; that copy is disposable.
 
-Whenever you change the manager's behaviour, change it here too, in the same
-commit. `diff -q` the two before you finish.
+- Never edit the repo copy. Fix the plugin, `/plugin update agent-fleet`, re-copy.
+- Never fork it per project. If a project needs different checks, that belongs in
+  `<repo>/.claude/fleet.conf` as `CHECK_CMD`, not in a modified script.
+- If the repo's `.gitignore` allowlists paths under `.claude/`, add the script so it
+  stays versioned, and ignore `.claude/fleet-archive/`.
 
-## Manager helper script
+An earlier version of this pattern kept two hand-synced copies. They drifted, and a
+bug fix reached only one side — which is the whole reason the script is packaged
+rather than pasted.
 
-`herd.sh` in this skill directory is a portable manager wrapper: fleet status,
-reading a transcript, prompting, running checks, and staging a squash. Copy it to
-`<repo>/.claude/herd.sh` and set `CHECK_CMD` in `<repo>/.claude/fleet.conf` if the
-project is not npm-based. If the repo allowlists paths in `.gitignore`, add the
-script there so it stays versioned.
+`herd.sh` provides: `status`, `launch`, `watch`, `archive`, `recycle`, `read`,
+`say`, `check`, `land`. Run it with no arguments for usage.
 
 Use `git diff --numstat`, not `git status --porcelain`, for "is this tree dirty".
-On repos with mixed line endings `status` reports CRLF-only churn as modified and
-every gate you build on it will refuse to run.
+On repos with mixed line endings `status` reports line-ending-only churn as
+modified and every gate built on it will refuse to run.

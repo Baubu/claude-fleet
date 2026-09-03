@@ -13,7 +13,8 @@
         "name": "Baubu"
       },
       "source": "./plugins/agent-fleet",
-      "category": "development"
+      "category": "development",
+      "version": "1.0.0"
     }
   ]
 }

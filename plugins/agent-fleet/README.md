@@ -30,6 +30,7 @@ Requires [Herdr](https://herdr.dev) (`HERDR_ENV=1`) and a git repository.
 | `agents/lane-reviewer` | independent pre-merge review; returns MERGE / FIX / ESCALATE |
 | `hooks/` | `PreToolUse` guard: no `Edit`/`Write` in the main checkout while on the default branch |
 | `commands/fleet-init` | bootstraps a repository |
+| `commands/fleet-schedule` | optional recurring local task that refills the fleet |
 
 ## Why the guard hook matters
 

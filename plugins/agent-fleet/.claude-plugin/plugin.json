@@ -3,5 +3,6 @@
   "description": "Run parallel feature work as a fleet of Herdr agents: one git worktree per feature, one Claude agent per worktree, and a manager in the main checkout that reviews, sequences merges and files issues. Requires Herdr (HERDR_ENV=1) and a git repository.",
   "author": {
     "name": "Baubu"
-  }
+  },
+  "version": "1.0.0"
 }
