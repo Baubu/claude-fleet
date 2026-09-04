@@ -290,6 +290,22 @@ cmd_launch() {
     [ -d "$dir/node_modules/.bin" ] || die "install left no node_modules/.bin in $dir"
   fi
 
+  # Codegen, per worktree. `npm ci` does NOT do this unless the project happens
+  # to have a postinstall hook, and a lane with an ungenerated client fails its
+  # checks for reasons that have nothing to do with its work -- which, now that
+  # landing is gated on checks, silently blocks a lane that did nothing wrong.
+  # Diagnosing it is worse than it sounds: the symptom surfaces as an unrelated
+  # assertion (`Prisma.join is not a function` -> HTTP 500 -> "expected 200"),
+  # so it reads as a real product bug in whatever test happens to touch it first.
+  # Set CODEGEN_CMD in <repo>/.claude/fleet.conf for other toolchains.
+  local conf="$REPO/.claude/fleet.conf"
+  [ -f "$conf" ] && . "$conf"
+  if [ -n "${CODEGEN_CMD:-}" ]; then
+    ( cd "$dir" && eval "$CODEGEN_CMD" >/dev/null 2>&1 ) || die "codegen failed in $dir"
+  elif [ -f "$dir/prisma/schema.prisma" ]; then
+    ( cd "$dir" && npx prisma generate >/dev/null 2>&1 ) || die "prisma generate failed in $dir"
+  fi
+
   local -a args=()
   [ -n "$model" ]  && args+=(--model "$model")
   [ -n "$effort" ] && args+=(--effort "$effort")
