@@ -360,10 +360,19 @@ for a in sorted(rows, key=lambda r: r["pane_id"]):
     echo
     echo "## Needs a human"
     echo
-    echo "Collected from lane archives in this directory — each lane records its own"
-    echo "\"needs a human decision\" items before teardown."
+    echo "From merged pull requests and any lane archives. PR bodies are the primary"
+    echo "source: lanes are not recycled by default, so their decisions live there."
     echo
-    grep -h -A6 -iE '^#+ *(needs a human|open decisions)' "$ARCHIVE"/*.md 2>/dev/null       | grep -E '^[0-9]+\.|^- ' | sort -u | head -30 || echo "_(none recorded)_"
+    {
+      if command -v gh >/dev/null 2>&1; then
+        for n in $(gh pr list --state merged --limit 25 --json number,mergedAt                      -q ".[] | select(.mergedAt > \"$(date -u +%Y-%m-%dT00:00:00Z)\") | .number" 2>/dev/null); do
+          gh pr view "$n" --json body -q .body 2>/dev/null             | sed -n '/^#\+ *\(Needs a human\|Open decisions\|Not verified\|Could not verify\|Worth deciding\|Your decision\)/,/^#\+ /p'             | grep -E '^[0-9]+\. |^- |^\*\*' | sed "s|^|#$n |"
+        done
+      fi
+      grep -h -A6 -iE '^#+ *(needs a human|open decisions)' "$ARCHIVE"/*.md 2>/dev/null         | grep -E '^[0-9]+\.|^- '
+    } | sed 's/[[:space:]]\+$//' | grep -v '^$' | head -40 || true
+    echo
+    echo "_Full detail is in each PR body; this is only the index._"
   } > "$out"
   echo "$out"
 }
