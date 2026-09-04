@@ -46,6 +46,11 @@ Requires [Herdr](https://herdr.dev) (`HERDR_ENV=1`) and a git repository.
 ./.claude/herd.sh land <agent>      # check, then stage a squash merge
 ```
 
+`launch` takes optional `--model` (`opus`/`sonnet`/`fable`) and `--effort`
+(`low`…`max`) so a lane is sized to its problem rather than inheriting the session
+default for everything — match reasoning demand, not diff size, and never size
+down security, migration or user-facing-data work.
+
 `launch` does the whole thing: worktree on a fresh branch, `.env` copied in, a real
 dependency install, the agent started, and an opening brief that asks the lane to
 declare which files it intends to touch before it writes any code.

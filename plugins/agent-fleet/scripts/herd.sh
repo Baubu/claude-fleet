@@ -10,7 +10,8 @@
 # intended -- the manager then cannot edit feature code even by mistake.
 #
 #   ./.claude/herd.sh status            # lifecycle + git state for every lane
-#   ./.claude/herd.sh launch <n> <slug> # create a lane for issue <n>, end to end
+#   ./.claude/herd.sh launch <n> <slug> [name] [--model opus|sonnet|fable]
+#                                       [--effort low|medium|high|xhigh|max]
 #   ./.claude/herd.sh archive <agent>   # snapshot a lane's transcript, no teardown
 #   ./.claude/herd.sh recycle <agent>   # archive, then retire a fully-pushed lane
 #   ./.claude/herd.sh watch             # event stream of lane state changes
@@ -181,7 +182,20 @@ cmd_archive() {
 # Worktree, provisioning, agent, opening brief. Idempotent enough to re-run after
 # a failure: it refuses rather than half-building over an existing lane.
 cmd_launch() {
-  local issue="$1" slug="$2" name="${3:-$2}"
+  local issue="$1" slug="$2"; shift 2
+  local name="" model="" effort=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --model)  model="$2"; shift 2 ;;
+      --effort) effort="$2"; shift 2 ;;
+      --model=*)  model="${1#*=}"; shift ;;
+      --effort=*) effort="${1#*=}"; shift ;;
+      -*) die "unknown launch option: $1" ;;
+      *)  name="$1"; shift ;;
+    esac
+  done
+  name="${name:-$slug}"
+  case "${effort:-medium}" in low|medium|high|xhigh|max) ;; *) die "effort must be low|medium|high|xhigh|max" ;; esac
   local branch="issue-${issue}-${slug}" dir
   dir="$WT/issue-${issue}-${slug}"
   [ -e "$dir" ] && die "lane already exists at $dir"
@@ -208,7 +222,15 @@ cmd_launch() {
     [ -d "$dir/node_modules/.bin" ] || die "install left no node_modules/.bin in $dir"
   fi
 
-  herdr agent start "$name" --kind claude --pane "$pane" --timeout 120000 >/dev/null     || die "agent start failed for $name"
+  local -a args=()
+  [ -n "$model" ]  && args+=(--model "$model")
+  [ -n "$effort" ] && args+=(--effort "$effort")
+  if [ ${#args[@]} -gt 0 ]; then
+    echo "starting $name (${model:-default model}, ${effort:-default effort})" >&2
+    herdr agent start "$name" --kind claude --pane "$pane" --timeout 120000 -- "${args[@]}" >/dev/null       || die "agent start failed for $name"
+  else
+    herdr agent start "$name" --kind claude --pane "$pane" --timeout 120000 >/dev/null       || die "agent start failed for $name"
+  fi
 
   # First action is a file-intent declaration: the collision surface has to be
   # derived from what lanes actually plan to touch, not guessed up front.
@@ -299,7 +321,7 @@ cmd_land() {
 case "${1:-status}" in
   status) cmd_status ;;
   watch)  cmd_watch ;;
-  launch) shift; [ $# -ge 2 ] || die "launch needs <issue> <slug> [name]"; cmd_launch "$@" ;;
+  launch) shift; [ $# -ge 2 ] || die "launch needs <issue> <slug> [name] [--model M] [--effort L]"; cmd_launch "$@" ;;
   archive) shift; [ $# -ge 1 ] || die "archive needs an agent"; cmd_archive "$1" ;;
   recycle) shift; [ $# -ge 1 ] || die "recycle needs an agent"; cmd_recycle "$1" ;;
   read)   shift; [ $# -ge 1 ] || die "read needs an agent"; cmd_read "$@" ;;

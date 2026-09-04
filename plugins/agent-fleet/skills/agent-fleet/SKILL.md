@@ -59,6 +59,43 @@ Then start the agent in the pane that `worktree create` returned:
 herdr agent start <name> --kind claude --pane <wN:p1> --timeout 90000
 ```
 
+## Size the lane to the problem
+
+Lanes inherit the user's default model unless told otherwise, which usually means
+every lane runs the largest one — including the lane writing a document. Choose
+per lane:
+
+```bash
+./.claude/herd.sh launch 42 slug --model sonnet --effort medium
+```
+
+`--model` takes `opus`, `sonnet` or `fable` (or a full model name); `--effort`
+takes `low`, `medium`, `high`, `xhigh` or `max`. Omit either to inherit the
+session default.
+
+Match **reasoning demand, not diff size**. A 2,000-line generated dataset is
+mechanical; a 40-line change to a security header is not.
+
+| shape of work | suggested |
+|---|---|
+| security, auth, data-model or migration work | `opus`, `high`+ |
+| cross-cutting change touching many files at once | `opus`, `high` |
+| a subtle policy change — CSP, caching, access control | `opus`, `high` |
+| feature build against an existing reference implementation | `opus` or `sonnet`, `medium` |
+| scraper or transform with a worked example to copy | `sonnet`, `medium` |
+| tests, mechanical refactor, docs, research write-up | `sonnet`, `low`–`medium` |
+
+Two cautions from practice. **Do not size down anything that touches security,
+money, migrations or user-visible data** — the cost of a missed subtlety there
+dwarfs the saving, and audits are exactly where the expensive model earns its
+keep. And **a "documentation" issue often is not one**: a lane briefed to write a
+marketing strategy shipped 24 files including a blog engine and an embeddable
+widget, because the issue implied the build. Read what the issue actually asks for
+before sizing it.
+
+State the model and effort you chose, and why, when you report the lane. It is a
+spend decision the user may want to overrule.
+
 ## Brief a lane agent
 
 Every opening prompt states: the branch, that it must not leave the worktree or
