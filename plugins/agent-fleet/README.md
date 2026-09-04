@@ -2,7 +2,7 @@
 
 Run parallel feature work as a fleet of coding agents: **one git worktree per
 feature, one Claude agent per worktree**, and a manager in the main checkout that
-reviews, sequences merges and files issues.
+reviews the work, sequences merges, and files follow-up issues.
 
 ```
 w1  <repo>    [main]           MANAGER   reviews, merges, files issues
@@ -15,49 +15,93 @@ Requires [Herdr](https://herdr.dev) (`HERDR_ENV=1`) and a git repository.
 
 ## Install
 
-```
-/plugin marketplace add <owner>/claude-fleet
+```bash
+/plugin marketplace add Baubu/claude-fleet
 /plugin install agent-fleet
-/fleet-init
+/fleet-init                       # in each repository
 ```
 
 ## What it ships
 
 | | |
 |---|---|
-| `skills/agent-fleet` | the pattern — topology, briefing lanes, merge discipline, teardown |
-| `scripts/herd.sh` | manager CLI: `status`, `launch`, `watch`, `archive`, `recycle`, `read`, `say`, `check`, `land` |
+| `skills/agent-fleet` | the pattern — topology, briefing lanes, prioritisation, merge discipline, teardown |
+| `scripts/herd.sh` | the manager CLI |
 | `agents/lane-reviewer` | independent pre-merge review; returns MERGE / FIX / ESCALATE |
-| `hooks/` | `PreToolUse` guard: no `Edit`/`Write` in the main checkout while on the default branch |
-| `commands/fleet-init` | bootstraps a repository |
+| `hooks/` | `PreToolUse` guard — no `Edit`/`Write` in the main checkout on the default branch |
+| `commands/fleet-init` | bootstraps a repository (idempotent) |
 | `commands/fleet-schedule` | optional recurring local task that refills the fleet |
+
+## The manager CLI
+
+```bash
+./.claude/herd.sh status            # lifecycle + git state for every lane
+./.claude/herd.sh launch <n> <slug> # create a lane for issue <n>, end to end
+./.claude/herd.sh watch             # event stream of lane state changes
+./.claude/herd.sh archive <agent>   # snapshot a lane's transcript, no teardown
+./.claude/herd.sh recycle <agent>   # archive, then retire a fully-pushed lane
+./.claude/herd.sh read <agent> [n]  # last n lines of an agent's transcript
+./.claude/herd.sh say <agent> <txt> # prompt an agent
+./.claude/herd.sh check <agent>     # lint + test + build that agent's worktree
+./.claude/herd.sh land <agent>      # check, then stage a squash merge
+```
+
+`launch` does the whole thing: worktree on a fresh branch, `.env` copied in, a real
+dependency install, the agent started, and an opening brief that asks the lane to
+declare which files it intends to touch before it writes any code.
+
+`check` runs `CHECK_CMD` from `<repo>/.claude/fleet.conf` if present, otherwise
+detects npm, cargo or make.
+
+## A typical cycle
+
+```bash
+./.claude/herd.sh launch 42 add-export     # open a lane
+./.claude/herd.sh watch                    # arm with the Monitor tool, persistent
+```
+
+`watch` emits one line per transition into `idle`, `done`, `blocked` or `vanished`,
+so finished lanes announce themselves instead of waiting to be noticed. When one
+lands, the manager re-runs the checks itself, opens a PR carrying that evidence,
+records what could not be verified, and picks the next issue.
 
 ## Why the guard hook matters
 
-The manager sits in the main checkout on the default branch. The hook denies
-edits there, so the review-and-merge role is **enforced rather than intended** —
-the manager cannot edit feature code even by mistake. Work inside
+The manager sits in the main checkout on the default branch. The hook denies edits
+there, so the review-and-merge role is **enforced rather than intended** — the
+manager cannot write feature code even by mistake. Work inside
 `.claude/worktrees/` and files outside the repository are unaffected.
 
-## Running it
+The protected branch is resolved from `origin/HEAD`, so `master` and `develop`
+repos work without configuration. Hooks register at session start: after
+installing or updating, restart before relying on it.
 
-```bash
-./.claude/herd.sh launch 42 some-slug   # worktree + deps + agent + brief
-./.claude/herd.sh watch                 # arm with the Monitor tool, persistent
-./.claude/herd.sh status                # lifecycle + git state per lane
-./.claude/herd.sh check <agent>         # lint + test + build that lane
-```
+## Things this gets wrong if you let it
 
-Arm `watch` with the Monitor tool so finished lanes announce themselves instead
-of waiting to be noticed.
+Each of these cost real time before it was written down.
 
-## Three things learned the hard way
+- **Prioritise by value, not by what cannot collide.** Filling lanes with cheap
+  disjoint issues while the thing you actually care about sits untouched optimises
+  for the manager's convenience.
+- **Derive the collision surface; do not guess it.** Ask each lane to declare the
+  files it will touch. Guessing sent three lanes to watch a schema file while they
+  actually collided on the seed file.
+- **Give every lane its own dependency install.** Linking one `node_modules` across
+  worktrees fails the moment any lane runs an install, leaving a partial tree that
+  breaks lint and test everywhere — silently.
+- **`idle` does not mean finished.** A lane can settle between phases and resume. One
+  produced a second commit answering its own open question *after* its PR was
+  merged. Gate on git evidence, not lifecycle state.
+- **Verify what lanes tell you.** One reported corrupting a shared dependency tree,
+  reasoning from documentation describing a design that had already been replaced.
+  It had not.
+- **Recycle only when something forces it.** The transcript survives teardown; the
+  live pane, where you can still ask a follow-up, does not.
+- **`blocked` escalates to the human.** A blocked lane is sitting on an approval or
+  question dialog. Read it and ask — never answer it on the lane's behalf.
 
-- **Derive the collision surface, don't guess it.** Ask each lane to declare the
-  files it intends to touch before it writes code. Guessing sent three lanes to
-  watch a schema file while they actually collided on the seed file.
-- **Give every lane its own dependency install.** Linking one `node_modules`
-  across worktrees fails the moment any lane runs an install, and leaves a partial
-  tree that breaks lint and test everywhere — silently.
-- **`idle` does not mean finished.** An agent can settle between phases and resume.
-  Gate "done" on git evidence, not lifecycle state.
+## Cost
+
+The fleet multiplies token spend roughly linearly in lane count. That is the trade
+for wall-clock parallelism. If the account bills beyond its plan, an unattended
+refill loop is exactly the shape that runs into it — cap the lanes.
