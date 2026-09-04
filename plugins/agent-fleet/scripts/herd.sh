@@ -77,30 +77,54 @@ for a in sorted(rows, key=lambda r: r["pane_id"]):
 # emit, otherwise a crashed lane is indistinguishable from a working one.
 cmd_watch() {
   python -u -c '
-import json, subprocess, sys, time
+import json, subprocess, time
+
+def sh(args, cwd=None):
+    try:
+        r = subprocess.run(args, capture_output=True, timeout=30, cwd=cwd)
+        return r.stdout.decode("utf-8", "replace").strip()
+    except Exception:
+        return None
 
 def poll():
+    out = sh(["herdr", "agent", "list"])
+    if out is None:
+        return None  # transient: never kill the watch over one bad poll
     try:
-        out = subprocess.run(["herdr", "agent", "list"], capture_output=True,
-                             timeout=30).stdout.decode("utf-8", "replace")
         return {a["name"]: a for a in json.loads(out)["result"]["agents"] if a.get("name")}
     except Exception:
-        return None  # transient: never kill the watch over one bad poll
+        return None
+
+def head(cwd):
+    return sh(["git", "-C", cwd, "rev-parse", "--short", "HEAD"]) or "?"
 
 SETTLED = {"idle", "done", "blocked"}
-prev = {}
+# Announce a (lane, state, commit) combination at most once. A pane that settles,
+# wakes and settles again with no new commit is noise, and the fleet generates a
+# lot of it after a restart -- but a lane that settles again ON A NEW COMMIT has
+# genuinely done more work and must still be heard.
+seen = set()
+prev = set()
 first = True
 while True:
     cur = poll()
     if cur is not None:
         for name, a in sorted(cur.items()):
             st = a["agent_status"]
-            was = prev.get(name)
-            if st != was and st in SETTLED and not (first and st == "idle"):
-                print("LANE %s -> %s (pane %s)" % (name, st, a["pane_id"]))
-        for name in sorted(set(prev) - set(cur)):
+            if st not in SETTLED:
+                continue
+            h = head(a.get("cwd") or ".")
+            key = (name, st, h)
+            if key in seen:
+                continue
+            seen.add(key)
+            # blocked always speaks: it means a human is being waited on.
+            if first and st == "idle":
+                continue
+            print("LANE %s -> %s @%s (pane %s)" % (name, st, h, a["pane_id"]))
+        for name in sorted(prev - set(cur)):
             print("LANE %s -> vanished (pane closed or agent exited)" % name)
-        prev = {n: a["agent_status"] for n, a in cur.items()}
+        prev = set(cur)
         first = False
     time.sleep(20)
 '
