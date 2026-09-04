@@ -38,6 +38,7 @@ Requires [Herdr](https://herdr.dev) (`HERDR_ENV=1`) and a git repository.
 ./.claude/herd.sh status            # lifecycle + git state for every lane
 ./.claude/herd.sh launch <n> <slug> # create a lane for issue <n>, end to end
 ./.claude/herd.sh watch             # event stream of lane state changes
+./.claude/herd.sh report [since]    # what the fleet did, for a human catching up
 ./.claude/herd.sh archive <agent>   # snapshot a lane's transcript, no teardown
 ./.claude/herd.sh recycle <agent>   # archive, then retire a fully-pushed lane
 ./.claude/herd.sh read <agent> [n]  # last n lines of an agent's transcript
@@ -102,6 +103,10 @@ Each of these cost real time before it was written down.
   It had not.
 - **Recycle only when something forces it.** The transcript survives teardown; the
   live pane, where you can still ask a follow-up, does not.
+- **Keep working; escalate rarely.** Merging green PRs, rebasing, filing issues and
+  opening lanes are the manager's job, not requests. Escalate only what is
+  irreversible and user-visible, a blocked lane, a real product decision, or a
+  safety refusal. Run `herd.sh report` when you stop, so the day is reconstructable.
 - **`blocked` escalates to the human.** A blocked lane is sitting on an approval or
   question dialog. Read it and ask — never answer it on the lane's behalf.
 

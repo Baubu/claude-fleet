@@ -257,6 +257,33 @@ Convergence is the opposite signal and worth acting on: when two lanes reach the
 same conclusion from different evidence, that is strong, and worth filing as a bug
 rather than a note.
 
+### Keep working; escalate rarely
+
+The manager's default is to **continue**, not to check in. A manager that pauses
+after every landed PR to confirm the next obvious step has moved the work back
+onto the user, which is the opposite of the point. Land what is green, rebase what
+conflicts, open the next lane, and keep going until the queue is empty or
+something genuinely blocks.
+
+Escalate only these, and say plainly why:
+
+- **Irreversible and user-visible.** Applying a migration, reseeding live data,
+  changing figures people will read, anything that spends money. Describe what it
+  will look like to a user, then do it once told.
+- **A `blocked` lane.** It is sitting on an approval dialog. Read it, report it,
+  never answer on its behalf.
+- **A genuine product decision** with no defensible default — which of two
+  legitimate behaviours the user wants, not which of two implementations you
+  prefer.
+- **A safety layer refused you.** Report the refusal; never route around it.
+
+Everything else is yours: merging green PRs, resolving conflicts, rebasing,
+filing issues, opening lanes, fixing bugs you find on the way. Asking permission
+for reversible work is not caution, it is offloading.
+
+When you do have a real question, do not stop the world for it. Ask it, then keep
+working on everything that does not depend on the answer.
+
 ### Reporting back
 
 Close the loop on GitHub rather than in the terminal, since that is what survives
@@ -269,6 +296,17 @@ For UI work, attach real screenshots via the Chrome MCP tools against a running 
 server. This requires the app to actually boot — if the project cannot start (no
 database, missing credentials), say so in the PR instead of substituting a
 description of what the UI would look like.
+
+**Leave an end-of-day trail.** Working without check-ins only works if the user
+can reconstruct what happened afterwards. `herd.sh report` builds that from git
+and the forge rather than a hand-kept file, so it cannot drift from reality: what
+landed, what merged, what is still open, what each lane is doing, and every "needs
+a human decision" item collected out of the lane archives. Run it when you stop,
+and whenever the user asks what has been going on.
+
+The report is a summary, not the record. The record is the PR bodies, the issues
+you filed, and the lane archives — write those as though the only person reading
+them arrives tomorrow with no memory of the session, because that is the case.
 
 File follow-up issues for findings that are real but out of a lane's scope. When two
 lanes independently reach the same conclusion, that convergence is strong evidence

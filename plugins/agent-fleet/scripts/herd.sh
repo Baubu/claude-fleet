@@ -12,6 +12,7 @@
 #   ./.claude/herd.sh status            # lifecycle + git state for every lane
 #   ./.claude/herd.sh launch <n> <slug> [name] [--model opus|sonnet|fable]
 #                                       [--effort low|medium|high|xhigh|max]
+#   ./.claude/herd.sh report [since]    # what the fleet did, for a human catching up
 #   ./.claude/herd.sh archive <agent>   # snapshot a lane's transcript, no teardown
 #   ./.claude/herd.sh recycle <agent>   # archive, then retire a fully-pushed lane
 #   ./.claude/herd.sh watch             # event stream of lane state changes
@@ -305,6 +306,68 @@ cmd_recycle() {
   echo "recycled $a (workspace $ws, branch $b -- origin copy retained)"
 }
 
+# report [since] -- what the fleet actually did, for a human catching up.
+# Default window is today. Reads git and the forge rather than any hand-kept
+# file, so it cannot drift from what really happened.
+cmd_report() {
+  local since="${1:-midnight}" out
+  out="$ARCHIVE/report-$(date -u +%Y%m%d).md"
+  mkdir -p "$ARCHIVE"
+  {
+    echo "# Fleet report — $(date +'%Y-%m-%d %H:%M')"
+    echo
+    echo "Window: since $since. Repository: $(basename "$REPO")."
+    echo
+    echo "## Landed on $(git -C "$REPO" rev-parse --abbrev-ref HEAD)"
+    echo
+    git -C "$REPO" log --since="$since" --first-parent --pretty='- %s' 2>/dev/null || true
+    echo
+    if command -v gh >/dev/null 2>&1; then
+      echo "## Pull requests merged"
+      echo
+      gh pr list --repo "$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null)"         --state merged --limit 40         --json number,title,mergedAt         -q ".[] | select(.mergedAt > \"$(date -u -d "$since" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT00:00:00Z)\") | \"- #\(.number) \(.title)\"" 2>/dev/null || echo "_(none, or gh unavailable)_"
+      echo
+      echo "## Still open"
+      echo
+      gh pr list --state open --limit 40 --json number,title,mergeable         -q '.[] | "- #\(.number) \(.title) — \(.mergeable)"' 2>/dev/null || echo "_(none)_"
+      echo
+      echo "## Issues opened"
+      echo
+      gh issue list --state all --limit 40 --json number,title,createdAt,state         -q ".[] | select(.createdAt > \"$(date -u +%Y-%m-%dT00:00:00Z)\") | \"- #\(.number) \(.title) [\(.state)]\"" 2>/dev/null || echo "_(none)_"
+      echo
+    fi
+    echo "## Lanes"
+    echo
+    printf '%-16s %-9s %s
+' "AGENT" "STATE" "BRANCH / COMMITS AHEAD"
+    herdr agent list 2>/dev/null | python -c '
+import sys, json, subprocess, os
+try:
+    rows = json.loads(sys.stdin.buffer.read().decode("utf-8","replace"))["result"]["agents"]
+except Exception:
+    rows = []
+for a in sorted(rows, key=lambda r: r["pane_id"]):
+    n = a.get("name")
+    if not n:
+        continue
+    cwd = a.get("cwd") or "."
+    def sh(*c):
+        try: return subprocess.run(c, capture_output=True, timeout=20).stdout.decode("utf-8","replace").strip()
+        except Exception: return "?"
+    br = sh("git","-C",cwd,"rev-parse","--abbrev-ref","HEAD")
+    ahead = sh("git","-C",cwd,"rev-list","--count","origin/main..HEAD")
+    print("%-16s %-9s %s (+%s)" % (n, a["agent_status"], br, ahead))'
+    echo
+    echo "## Needs a human"
+    echo
+    echo "Collected from lane archives in this directory — each lane records its own"
+    echo "\"needs a human decision\" items before teardown."
+    echo
+    grep -h -A6 -iE '^#+ *(needs a human|open decisions)' "$ARCHIVE"/*.md 2>/dev/null       | grep -E '^[0-9]+\.|^- ' | sort -u | head -30 || echo "_(none recorded)_"
+  } > "$out"
+  echo "$out"
+}
+
 cmd_read() { herdr agent read "$1" --source recent-unwrapped --lines "${2:-80}"; }
 
 cmd_say() {
@@ -346,6 +409,7 @@ case "${1:-status}" in
   status) cmd_status ;;
   watch)  cmd_watch ;;
   launch) shift; [ $# -ge 2 ] || die "launch needs <issue> <slug> [name] [--model M] [--effort L]"; cmd_launch "$@" ;;
+  report) shift; cmd_report "$@" ;;
   archive) shift; [ $# -ge 1 ] || die "archive needs an agent"; cmd_archive "$1" ;;
   recycle) shift; [ $# -ge 1 ] || die "recycle needs an agent"; cmd_recycle "$1" ;;
   read)   shift; [ $# -ge 1 ] || die "read needs an agent"; cmd_read "$@" ;;
