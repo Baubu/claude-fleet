@@ -19,7 +19,8 @@
 #   ./.claude/herd.sh read <agent> [n]  # last n lines of an agent's transcript
 #   ./.claude/herd.sh say <agent> <txt> # prompt an agent
 #   ./.claude/herd.sh check <agent>     # lint+test+build that agent's worktree
-#   ./.claude/herd.sh land <agent>      # check, squash-merge to main, tear down
+#   ./.claude/herd.sh document <agent>  # post the lane's summary to its issue
+#   ./.claude/herd.sh land <agent>      # check, require a summary, squash to main
 #
 # Agent names are set at `herdr agent start` time and follow the pane.
 set -uo pipefail
@@ -203,6 +204,48 @@ cmd_archive() {
   echo "archived -> $(archive_lane "$a" "$d" "$b")"
 }
 
+# Ask a lane to write its own closing summary, and leave it at
+# <worktree>/.claude/lane-summary.md. Returns non-zero if nothing was written.
+#
+# The target must be INSIDE the agent's own worktree: a lane agent is scoped to
+# its cwd and cannot write elsewhere without an approval prompt, which is what
+# made an archive-directory path fail silently. .claude/ is gitignored in the
+# worktree, and `git diff` ignores untracked files anyway, so this cannot dirty
+# the tree the landing checks require clean.
+#
+# `agent read` is not a substitute: it recovers only what is still on screen,
+# and a long closing summary has usually scrolled off the alternate screen.
+capture_summary() {
+  local a="$1" d="$2" dump
+  dump="$d/.claude/lane-summary.md"
+  mkdir -p "$d/.claude"
+  [ -s "$dump" ] && return 0
+  herdr agent prompt "$a" "Write a COMPLETE summary of your work to .claude/lane-summary.md (relative to your current directory) as Markdown, with these headings exactly: '## What was done', '## Still needs a human', '## Verified'. Under 'What was done' be concrete and name the change, not the intention. Under 'Still needs a human' list every open decision, or write 'nothing' -- do not leave it empty. Under 'Verified' name the checks you actually ran and their results; if you could not verify something, say so rather than omitting it. This file becomes the issue comment and the durable record after your session ends. Reply with only the word DONE." --wait --timeout 180000 >/dev/null 2>&1 \
+    || echo "warning: '$a' did not answer the summary request" >&2
+  [ -s "$dump" ]
+}
+
+# document <agent> -- post the lane's closing summary to its GitHub issue.
+#
+# Landing work without saying what landed makes the forge useless as a status
+# view: the decisions live in a pane that nobody reads and that eventually goes
+# away. `land` calls this, so an undocumented merge takes deliberate effort.
+cmd_document() {
+  local a="$1" d b issue dump
+  d="$(wt_of "$a")"; [ -n "$d" ] && [ -d "$d" ] || die "no worktree for agent '$a'"
+  b="$(git -C "$d" rev-parse --abbrev-ref HEAD)"
+  issue="$(printf '%s' "$b" | sed -n 's/^issue-\([0-9][0-9]*\)-.*/\1/p')"
+  [ -n "$issue" ] || die "cannot derive an issue number from branch '$b' (expected issue-<n>-<slug>)"
+  command -v gh >/dev/null 2>&1 || die "gh is not available"
+  capture_summary "$a" "$d" || die "'$a' wrote no summary -- nothing to post"
+  dump="$d/.claude/lane-summary.md"
+  gh issue comment "$issue" --body-file "$dump" >/dev/null \
+    || die "failed to comment on issue #$issue"
+  mkdir -p "$ARCHIVE"
+  cp "$dump" "$ARCHIVE/${a}-${b}-summary.md"
+  echo "documented #$issue from $a ($(wc -l < "$dump") lines)"
+}
+
 # launch <issue> <slug> [agent-name] -- create a lane end to end.
 # Worktree, provisioning, agent, opening brief. Idempotent enough to re-run after
 # a failure: it refuses rather than half-building over an existing lane.
@@ -259,7 +302,7 @@ cmd_launch() {
 
   # First action is a file-intent declaration: the collision surface has to be
   # derived from what lanes actually plan to touch, not guessed up front.
-  herdr agent prompt "$name" "You are working solo in a git worktree on branch $branch. Never leave this directory, never checkout or commit to main. FIRST ACTION, before writing any code: run 'gh issue view $issue', then reply with the list of files you expect to modify. Other agents are working in parallel worktrees on this same repo and the manager needs that list to detect collisions. Then continue without waiting for a reply. Read CLAUDE.md and follow it strictly. Implement issue $issue. If you must touch a file that looks shared (schema, seed, lockfile, layout, config), keep the change minimal and additive and flag it prominently in your closing summary. Commit to this branch with a conventional commit message ending in 'Closes #$issue'. When done, reply with a short summary: what you built, files changed, which shared files you touched, what you could NOT verify, and anything needing a human decision." >/dev/null     || die "opening prompt failed for $name"
+  herdr agent prompt "$name" "You are working solo in a git worktree on branch $branch. Never leave this directory, never checkout or commit to main. FIRST ACTION, before writing any code: run 'gh issue view $issue', then reply with the list of files you expect to modify. Other agents are working in parallel worktrees on this same repo and the manager needs that list to detect collisions. Then continue without waiting for a reply. Read CLAUDE.md and follow it strictly. Implement issue $issue. If you must touch a file that looks shared (schema, seed, lockfile, layout, config), keep the change minimal and additive and flag it prominently in your closing summary. Commit to this branch with a conventional commit message ending in 'Closes #$issue'. When done, write your closing summary to .claude/lane-summary.md in this worktree, with the headings '## What was done', '## Still needs a human' and '## Verified' -- that file is posted verbatim as a comment on issue #$issue, so write it for the repository owner rather than for me. Say what you could NOT verify rather than omitting it, and write 'nothing' under 'Still needs a human' if that is genuinely true. Then reply with the same summary in the pane." >/dev/null     || die "opening prompt failed for $name"
   echo "launched $name -> $pane ($branch)"
 }
 
@@ -284,9 +327,7 @@ cmd_recycle() {
   mkdir -p "$ARCHIVE"
   local dump="$d/.claude/lane-summary.md"
   local final="$ARCHIVE/${a}-${b}-summary.md"
-  mkdir -p "$d/.claude"
-  herdr agent prompt "$a" "Before this session is closed, write a COMPLETE summary of your work to .claude/lane-summary.md (relative to your current directory) as Markdown. Include: what you built, every file changed, which shared files you touched, exactly what you could NOT verify, and every item that needs a human decision. This file is the durable record after your session ends, so omit nothing a reviewer would need. Reply with only the word DONE." --wait --timeout 180000 >/dev/null 2>&1     || echo "warning: '$a' did not answer the summary request" >&2
-  if [ -s "$dump" ]; then
+  if capture_summary "$a" "$d"; then
     cp "$dump" "$final"
     echo "captured agent summary ($(wc -l < "$dump") lines)"
   else
@@ -408,9 +449,19 @@ cmd_land() {
   cmd_check "$a" || die "checks failed for '$a' -- not landing"
   git -C "$REPO" rev-parse --abbrev-ref HEAD | grep -qx main || die "manager checkout is not on main"
   [ "$(content_dirty "$REPO")" = 0 ] || die "main checkout has uncommitted content changes"
+
+  # Documentation is a landing requirement, not a later cleanup. Gate on it in
+  # the same breath as lint/test/build: work whose decisions were never written
+  # down is not finished, it is merely merged. Captured BEFORE the merge because
+  # the agent that knows the answers is still alive and still has its context.
+  capture_summary "$a" "$d" \
+    || die "'$a' wrote no closing summary -- not landing an undocumented merge"
+
   git -C "$REPO" merge --squash "$b" || die "squash merge hit conflicts -- resolve in the main checkout"
   echo "Staged squash of '$b'. Review with: git -C \"$REPO\" diff --cached"
-  echo "Then commit, and tear the lane down with:"
+  echo "Then commit, and post the summary to the issue with:"
+  echo "  ./.claude/herd.sh document $a"
+  echo "Tear the lane down (only when disk or clutter demands it) with:"
   echo "  herdr worktree remove --workspace <wN> --force && git -C \"$REPO\" branch -D $b"
 }
 
@@ -424,6 +475,7 @@ case "${1:-status}" in
   read)   shift; [ $# -ge 1 ] || die "read needs an agent"; cmd_read "$@" ;;
   say)    shift; [ $# -ge 1 ] || die "say needs an agent"; cmd_say "$@" ;;
   check)  shift; [ $# -ge 1 ] || die "check needs an agent"; cmd_check "$1" ;;
+  document) shift; [ $# -ge 1 ] || die "document needs an agent"; cmd_document "$1" ;;
   land)   shift; [ $# -ge 1 ] || die "land needs an agent"; cmd_land "$1" ;;
   *)      sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \?//' ;;
 esac

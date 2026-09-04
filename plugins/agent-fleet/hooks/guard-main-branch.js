@@ -60,6 +60,25 @@ try {
 
 // Only guard files that live inside this repository.
 if (!root || !target.startsWith(norm(root) + "/")) allow();
+
+// ...and only inside the repository this session is actually managing. Without
+// this the guard fires on ANY git repo that happens to sit on its default
+// branch — a sibling project, a dotfiles repo, or this plugin's own marketplace
+// checkout — none of which are the manager's seat. It cost a real edit: writing
+// to the plugin was refused on the grounds that the plugin was "the main
+// checkout". When CLAUDE_PROJECT_DIR is unset we cannot tell, so we keep
+// guarding rather than silently becoming a no-op.
+const projectDir = process.env.CLAUDE_PROJECT_DIR;
+if (projectDir) {
+  let projectRoot = null;
+  try {
+    projectRoot = execFileSync("git", ["-C", projectDir, "rev-parse", "--show-toplevel"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {}
+  if (projectRoot && norm(projectRoot) !== norm(root)) allow();
+}
 // The protected branch is whatever this repo calls its default -- main, master,
 // develop -- not a hardcoded name. origin/HEAD is authoritative when present.
 let base = null;

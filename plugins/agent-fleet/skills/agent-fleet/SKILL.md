@@ -324,6 +324,19 @@ shared state:
 - **Record decisions where they survive.** Every "needs a human decision" item goes
   in the PR body, not just the lane's pane. The pane is ephemeral; a reviewer coming
   back tomorrow reads the PR.
+- **Comment on every issue you land.** `land` refuses a lane that has not written
+  `.claude/lane-summary.md`, and `document <agent>` posts it to the issue. Three
+  headings, always: **What was done** (concrete, naming the change rather than the
+  intention), **Still needs a human** (every open decision, or the literal word
+  `nothing` — never blank, because blank and "nothing" read identically and usually
+  mean "never considered"), and **Verified** (the checks actually run, and what
+  could not be checked). The summary is captured *before* the merge, while the agent
+  that knows the answers is still alive and holding its context.
+
+  Do not treat this as paperwork. A fleet that closes seventeen issues in a week and
+  comments on none of them has produced a repository its owner cannot read: the work
+  is invisible, and "what needs my attention?" has no answer anywhere. That is a real
+  failure, and it is the default outcome unless landing enforces otherwise.
 - **Sequence conflicting PRs explicitly.** When two lanes touch the same file, say in
   both PR bodies which lands first and why, then rebase the second rather than
   letting a merge queue guess.
@@ -449,8 +462,18 @@ An earlier version of this pattern kept two hand-synced copies. They drifted, an
 bug fix reached only one side — which is the whole reason the script is packaged
 rather than pasted.
 
-`herd.sh` provides: `status`, `launch`, `watch`, `archive`, `recycle`, `read`,
-`say`, `check`, `land`. Run it with no arguments for usage.
+`herd.sh` provides: `status`, `launch`, `watch`, `report`, `archive`, `recycle`,
+`read`, `say`, `check`, `document`, `land`. Run it with no arguments for usage.
+
+`launch` takes `--model opus|sonnet|fable` and `--effort low|medium|high|xhigh|max`.
+Choose both from the issue rather than by habit: a one-file mechanical fix does not
+need Opus at `xhigh`, and a design or data-modelling issue is badly served by less.
+
+`report` reconstructs the window from git and the forge — **not** from lane
+archives. It once read only archives, which are written on teardown, and since
+lanes are deliberately not torn down it reported "(none recorded)" while twenty
+open decisions sat unread. The general rule: never source status from an artefact
+that only exists after cleanup.
 
 Use `git diff --numstat`, not `git status --porcelain`, for "is this tree dirty".
 On repos with mixed line endings `status` reports line-ending-only churn as
