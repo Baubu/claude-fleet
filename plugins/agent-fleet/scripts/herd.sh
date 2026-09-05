@@ -189,11 +189,16 @@ cmd_plan() {
 # Issues come from the live lanes plus any numbers given. Exit 1 if any overlap,
 # so launch can fold the result into the lane's brief.
 cmd_collisions() {
-  local issues="" d n
+  local issues="" d n st
   for d in "$WT"/issue-*/; do
     [ -e "$d/.git" ] || continue
     n="$(issue_of_branch "$(basename "$d")")"
-    [ -n "$n" ] && issues="$issues $n"
+    [ -n "$n" ] || continue
+    # Lanes are not recycled by default, so a merged lane's worktree lingers.
+    # Its issue is closed; its files are on main, not a live collision.
+    st="$(ghr issue view "$n" --json state -q .state 2>/dev/null || echo OPEN)"
+    [ "$st" = "CLOSED" ] && continue
+    issues="$issues $n"
   done
   issues="$issues $*"
   local tmp; tmp="$(mktemp)"
@@ -691,9 +696,9 @@ build_brief() {
   checkcmd="$(check_cmd_for "$dir")"
   brief="You are working solo in a git worktree on branch $branch. Never leave this directory, never checkout or commit to main. Other agents are working in parallel worktrees on this same repo. Read CLAUDE.md and follow it strictly."
   if [ -n "$plan" ]; then
-    brief="$brief FIRST ACTION, before writing any code: run 'gh issue view $issue --comments'. The comment that begins '$PLAN_MARK' is your plan, written by the manager. Follow its Files and Interfaces exactly: create and modify only the paths it lists, and expose the interfaces it names, so that sibling lanes can build against them. Reply with one line confirming the files you will touch, then continue without waiting. If you must deviate from the plan, do so minimally and explain it in your closing summary under '## Deviations from plan'."
+    brief="$brief FIRST ACTION, before writing any code: run 'gh issue view $issue --comments'. The comment that begins '$PLAN_MARK' is your plan, written by the manager. Follow its Files and Interfaces exactly: create and modify only the paths it lists, and expose the interfaces it names, so that sibling lanes can build against them. State in one line the files you will touch, as the first line of your work, and keep going in the same turn -- do not end your turn until the issue is implemented, checked and committed. If you must deviate from the plan, do so minimally and explain it in your closing summary under '## Deviations from plan'."
   else
-    brief="$brief FIRST ACTION, before writing any code: run 'gh issue view $issue', then reply with the list of files you expect to modify -- the manager needs that list to detect collisions. Then continue without waiting for a reply."
+    brief="$brief FIRST ACTION, before writing any code: run 'gh issue view $issue', then state in one line the files you expect to modify -- the manager needs that list to detect collisions -- and keep going in the same turn; do not end your turn until the issue is implemented, checked and committed."
   fi
   if [ -n "$surface" ]; then
     brief="$brief SHARED COLLISION SURFACE -- files another lane also plans to touch: $(printf '%s' "$surface" | awk -F'\t' '{printf "%s (%s); ", $1, $2}'). Keep any change there minimal and additive, and flag it in your summary."
