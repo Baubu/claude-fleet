@@ -36,6 +36,7 @@
 #   REQUIRE_PLAN   1 (default): launch refuses an issue that has no fleet plan comment
 #   LAND_MODE      squash (default) | pr
 #   AUTO_MERGE     1 (default): in pr mode, land/pr wait for CI and merge -- the manager merges, not a person
+#   AUTO_RECYCLE   1 (default): merge then recycles the lane (archive, remove worktree + pane, drop local branch)
 #   REVIEW_MODEL   model for `review` (default sonnet)
 #   STALE_MIN      minutes idle with no new commit before `watch` says stale (default 30)
 #   LANE_MODEL / LANE_EFFORT   defaults for launch when the plan and flags say nothing
@@ -70,6 +71,7 @@ load_conf() {
   REQUIRE_PLAN="${REQUIRE_PLAN:-1}"
   LAND_MODE="${LAND_MODE:-squash}"
   AUTO_MERGE="${AUTO_MERGE:-1}"
+  AUTO_RECYCLE="${AUTO_RECYCLE:-1}"
   REVIEW_MODEL="${REVIEW_MODEL:-sonnet}"
   STALE_MIN="${STALE_MIN:-30}"
   LANE_MODEL="${LANE_MODEL:-}"
@@ -363,8 +365,10 @@ while True:
                     print("LANE %s -> stale (idle %d min, no new commit @%s, pane %s)"
                           % (name, int((now - t0) // 60), h, a["pane_id"]))
         for name in sorted(prev - set(cur)):
-            print("LANE %s -> vanished (pane closed or agent exited)" % name)
             idle_since.pop(name, None)
+            if _closed.get(name, (None, 0))[0] == "CLOSED":
+                continue  # recycled after merge; expected
+            print("LANE %s -> vanished (pane closed or agent exited)" % name)
         prev = set(cur)
         first = False
     time.sleep(20)
@@ -894,6 +898,12 @@ cmd_merge() {
     git -C "$REPO" pull -q --ff-only origin main 2>/dev/null || warn "could not fast-forward the main checkout; run git pull"
   fi
   echo "merged #$n ($b) into main"
+  # The feature is on main; the lane has nothing left to do. Its pane costs
+  # real memory (about 200 MB per agent on the owner's machine) for as long as
+  # it stays open, and its transcript and summary survive teardown regardless.
+  if [ "$AUTO_RECYCLE" = 1 ]; then
+    cmd_recycle "$a" || warn "could not recycle '$a' after merge; run: ./.claude/herd.sh recycle $a"
+  fi
 }
 
 # pr <agent> [--no-review] [--no-merge] -- push the lane and open a pull request
@@ -989,11 +999,10 @@ cmd_land() {
 # ---------------------------------------------------------------------------
 
 # recycle <agent> -- retire a finished lane. Refuses to discard unpushed work.
+# Runs automatically after merge (AUTO_RECYCLE=1): an open pane is a running
+# agent process, and a finished one still holds its memory.
 cmd_recycle() {
   local a="$1" d b ws
-  # Deliberately NOT part of the normal flow. A finished lane costs only disk,
-  # and while its pane lives you can still ask it a follow-up. Recycle when disk
-  # or clutter actually demands it, not as routine hygiene after every merge.
   d="$(wt_of "$a")"; [ -n "$d" ] && [ -d "$d" ] || die "no worktree for agent '$a'"
   b="$(git -C "$d" rev-parse --abbrev-ref HEAD)"
   mkdir -p "$ARCHIVE"

@@ -453,18 +453,21 @@ that actually addresses the issue, a clean tree, and checks you re-ran. When a l
 goes idle a second time after you thought it was finished, re-read it rather than
 assuming it is noise.
 
-## Recycle only when something forces it
+## Recycle as soon as the feature is merged
 
-Retiring a lane is not routine hygiene after a merge. Keep it.
+A lane's pane is a running agent process. Finished or not, it holds its memory —
+about 200 MB per agent on the owner's machine — for as long as the pane exists.
+So the moment a lane's final version is reviewed and merged, retire it: `merge`
+does this itself (`AUTO_RECYCLE=1`), and `recycle <agent>` does it for anything
+merged by hand. Do not keep finished panes around in case a follow-up question
+comes up.
 
 The transcript survives teardown regardless — it lives under `~/.claude/projects/`
-keyed by the worktree path, and outlives both the pane and the directory. What
-teardown actually costs you is the **live** session: while the pane is alive you
-can ask the agent a follow-up, and it still holds all its context. That is worth
-more than the directory it occupies.
-
-So recycle when disk or clutter genuinely demands it, not on a schedule. When you
-do, record the Claude session id and the exact resume command in the archive:
+keyed by the worktree path, and outlives both the pane and the directory — and the
+closing summary is already on the issue and in the archive. If a follow-up is
+genuinely needed, resume the session from the archive's recorded command rather
+than paying for an idle pane on the chance. The archive records the Claude session
+id and the exact resume command:
 
 ```bash
 git worktree add "<worktree-path>" <branch>
@@ -587,6 +590,7 @@ agent and `brief <agent>` resends the opening prompt.
 | `REQUIRE_PLAN` | `1` (default) refuses to launch an issue with no plan comment |
 | `LAND_MODE` | `squash` (default) or `pr` |
 | `AUTO_MERGE` | `1` (default): in `pr` mode, wait for CI and merge; the manager merges, not a person |
+| `AUTO_RECYCLE` | `1` (default): after merge, archive the lane and close its worktree and pane |
 | `REVIEW_MODEL` | model for `review`; default `sonnet` |
 | `STALE_MIN` | idle minutes with no new commit before `watch` says stale; default 30 |
 | `LANE_MODEL`, `LANE_EFFORT` | defaults when neither the plan nor the flags say |

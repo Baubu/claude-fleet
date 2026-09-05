@@ -141,8 +141,9 @@ Each of these cost real time before it was written down.
 - **Verify what lanes tell you.** One reported corrupting a shared dependency tree,
   reasoning from documentation describing a design that had already been replaced.
   It had not.
-- **Recycle only when something forces it.** The transcript survives teardown; the
-  live pane, where you can still ask a follow-up, does not.
+- **Recycle the moment a feature is merged.** An open pane is a running agent and
+  holds roughly 200 MB whether it is working or finished. `merge` recycles the lane
+  itself; the transcript and summary survive teardown, so nothing is lost.
 - **Keep working; escalate rarely.** Merging green PRs, rebasing, filing issues and
   opening lanes are the manager's job, not requests — never end a landing by asking
   the owner to merge. Escalate only what is irreversible and user-visible, a
