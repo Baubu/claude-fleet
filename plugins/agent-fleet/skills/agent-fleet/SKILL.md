@@ -96,26 +96,99 @@ before sizing it.
 State the model and effort you chose, and why, when you report the lane. It is a
 spend decision the user may want to overrule.
 
+## Plan before launch
+
+The manager plans; the lane implements. The two documented failure modes of a
+fleet — a lane that solves a different, easier problem, and lanes that collide on
+a file nobody predicted — are both planning failures, and both are cheapest to
+prevent in the one place that can see every lane at once. So the manager, on the
+expensive model, writes a short plan per issue *before* opening the lane, and the
+lane, on the cheap model, executes it. `launch` refuses an unplanned issue by
+default (`REQUIRE_PLAN=1` in `fleet.conf`; `--no-plan` overrides once).
+
+Write the plan to a file **outside the repository** (the guard hook blocks writes in
+the main checkout; the scratchpad is fine), then post it:
+
+```bash
+./.claude/herd.sh plan 42 /path/to/plan-42.md
+```
+
+It becomes an issue comment beginning `<!-- fleet:plan -->`, mirrored under
+`.claude/fleet-archive/plans/`. The lane reads it with `gh issue view 42 --comments`.
+
+The plan is **contract-shaped, not step-shaped**. Six headings, all required:
+
+```markdown
+## Approach
+One paragraph: what to build and the shape of the solution. Not a tutorial.
+
+## Files
+- create: src/alerts/thresholds.py
+- modify: src/models.py
+- modify: src/cli.py
+
+## Interfaces
+Signatures, schema fields, CLI flags and event names other lanes will build
+against. `Thresholds.evaluate(stock: int) -> list[Alert]`; a new `Alert` model
+with fields ... These are commitments: a sibling lane may already be coding to them.
+
+## Tests
+What must be covered and where. Name the test file.
+
+## Out of scope
+What this lane must not touch, even if tempted.
+
+## Lane
+model: sonnet, effort: medium
+```
+
+Rules that make this worth the minute it costs:
+
+- **Files is exhaustive.** It is how `collisions` derives the shared surface before
+  any lane writes a line. A path the lane touches that is not listed is a review
+  finding unless the lane explains it under `## Deviations from plan`.
+- **Interfaces are the point.** Parallel lanes merge cleanly when they agree on
+  names and signatures up front and disagree on nothing else. Spend the planning
+  effort here, not on describing the code body.
+- **Split before launching.** A plan whose Files section runs past about eight
+  paths, or spans two top-level modules, is two issues. `plan` warns; take the
+  warning.
+- **Size the lane in the plan.** `launch` reads `model:` and `effort:` from the
+  `## Lane` line, so the sizing decision is recorded next to the reasoning that
+  produced it. Flags on `launch` still win.
+- **Plan on the expensive model; run the lane on the cheap one.** Planning is a few
+  hundred tokens of judgment; implementation is tens of thousands of tokens of
+  typing. Put the money where the judgment is.
+
 ## Brief a lane agent
 
-Every opening prompt states: the branch, that it must not leave the worktree or
-touch `main`, where to read the task (`gh issue view NN`), that project convention
-files apply, **which files are the shared collision surface**, and what the closing
-summary must contain.
+`launch` writes the brief. It states: the branch, that the lane must not leave the
+worktree or touch `main`, where the task and the plan are (`gh issue view NN
+--comments`), that project convention files apply, **which files are the shared
+collision surface** (computed from the plans of the live lanes), the exact check
+command to run before reporting done, and what the closing summary must contain.
 
 **Derive the collision surface; do not guess it.** Guessing from the issue titles
 is unreliable — a data-scraping fleet looks like it will collide on the schema and
-actually collides on the seed file, because that is where generated rows land. Two
-ways to get it right, in order of preference:
+actually collides on the seed file, because that is where generated rows land.
+Three ways to get it right, in order of preference:
 
-- Require each lane, as its *first* action, to post the list of files it intends to
-  modify. Compare the lists and re-brief before any of them writes code.
-- Failing that, `git log --format= --name-only -n 200 | sort | uniq -c | sort -rn`
+- Plan every issue (above). `collisions` then compares the plans' Files sections
+  and `launch` folds any overlap into the brief before the lane starts.
+- Without a plan, `launch` falls back to requiring the lane, as its *first* action,
+  to post the list of files it intends to modify. Compare the lists and re-brief
+  before any of them writes code.
+- Failing both, `git log --format= --name-only -n 200 | sort | uniq -c | sort -rn`
   gives the files this repo actually churns, which is a far better prior than the
   issue text.
 
 Then name the real overlap and require minimal additive changes plus a flag in the
 closing summary, so the manager can sequence merges instead of resolving conflicts.
+
+**Dependencies gate the launch.** An issue whose `## Depends on` section names an
+open issue by number is refused by `launch` (`deps <n>` shows why; `--force`
+overrides). Dependencies named only by title cannot be checked automatically —
+`deps` says so; confirm them yourself.
 
 ## Isolation is weaker than it looks
 
@@ -156,6 +229,16 @@ everything that is not.
 - **Prefer waiting to polling.** `herdr agent wait <name> --until blocked` and
   `--wait` on prompts are event-driven. A status loop on a short timer burns tokens
   across every lane at once for no new information.
+- **Review before landing, and not by the author.** `land` and `pr` run
+  `review <agent>` after the checks: a separate, headless, read-only session on a
+  cheaper model (`REVIEW_MODEL`) reads the diff against the plan and the brief and
+  ends with `MERGE`, `FIX` or `ESCALATE`. The verdict is posted to the issue.
+  `FIX` is sent straight back to the lane as a prompt and landing stops; `ESCALATE`
+  stops for you. `--no-review` exists for a one-line change you have read yourself,
+  not as a habit.
+- **`stale` is a signal, not noise.** `watch` says so when a lane has sat idle for
+  `STALE_MIN` minutes with no new commit. A lane that quietly gave up looks exactly
+  like one that finished; read it and either prompt it or recycle it.
 
 This plugin ships a `PreToolUse` hook that denies `Edit`/`Write` in the main
 checkout while HEAD is on the repository's default branch, which makes the
@@ -173,7 +256,7 @@ The manager should not need a human to notice that a lane finished. Emit lane st
 changes as an event stream and let the harness wake you:
 
 ```bash
-./.claude/herd.sh watch   # one line per transition into idle / done / blocked / vanished
+./.claude/herd.sh watch   # one line per transition into idle / done / blocked / vanished / stale
 ```
 
 Arm it with the Monitor tool, `persistent: true`. Two rules from Monitor's own
@@ -325,13 +408,22 @@ shared state:
   in the PR body, not just the lane's pane. The pane is ephemeral; a reviewer coming
   back tomorrow reads the PR.
 - **Comment on every issue you land.** `land` refuses a lane that has not written
-  `.claude/lane-summary.md`, and `document <agent>` posts it to the issue. Three
+  `.claude/lane-summary.md`, and `document <agent>` posts it to the issue. Four
   headings, always: **What was done** (concrete, naming the change rather than the
-  intention), **Still needs a human** (every open decision, or the literal word
-  `nothing` — never blank, because blank and "nothing" read identically and usually
-  mean "never considered"), and **Verified** (the checks actually run, and what
-  could not be checked). The summary is captured *before* the merge, while the agent
-  that knows the answers is still alive and holding its context.
+  intention), **Deviations from plan** (every file or interface that differs from
+  the plan comment, with the reason, or `none`), **Still needs a human** (every open
+  decision, or the literal word `nothing` — never blank, because blank and
+  "nothing" read identically and usually mean "never considered"), and **Verified**
+  (the checks actually run, and what could not be checked — the brief tells the
+  lane the exact command, so "I ran the tests" without output is a finding). The
+  summary is captured *before* the merge, while the agent that knows the answers is
+  still alive and holding its context.
+- **Prefer a pull request when the repo has CI.** `LAND_MODE=pr` in `fleet.conf`
+  (or `land --pr`) makes `land` push the branch and open a PR whose body is the
+  lane's summary plus the manager's own re-run check output and the review verdict,
+  ending in `Closes #n`. CI becomes a second gate and the PR is the durable record.
+  The default stays the staged squash, because not every repo has a remote worth
+  gating on.
 
   Do not treat this as paperwork. A fleet that closes seventeen issues in a week and
   comments on none of them has produced a repository its owner cannot read: the work
@@ -385,10 +477,12 @@ preserves that. Retiring a lane must not be how it disappears.
 
 `herdr agent read` is not sufficient on its own — a long completed response has
 usually scrolled off the terminal's alternate screen, and those rows never enter
-Herdr's host scrollback, so the read returns a near-empty pane. Before teardown,
-prompt the still-idle agent to write its full summary to an absolute path
-**outside its worktree** (writing inside would dirty the tree), wait for it, then
-archive that file alongside the pane read.
+Herdr's host scrollback, so the read returns a near-empty pane. That is why the
+brief asks the lane to write `.claude/lane-summary.md` inside its worktree when it
+finishes (a lane agent cannot write outside its cwd without an approval prompt, and
+an untracked file under `.claude/` does not dirty the tree), why `land` refuses
+without it, and why `recycle` asks for it one more time before teardown and
+archives it alongside the pane read.
 
 Put the decisions in the PR body too. The archive is the backstop for everything
 that never makes it there.
@@ -453,21 +547,43 @@ The plugin ships `scripts/herd.sh` and it is the **single source of truth**.
 `/fleet-init` copies it to `<repo>/.claude/herd.sh`; that copy is disposable.
 
 - Never edit the repo copy. Fix the plugin, `/plugin update agent-fleet`, re-copy.
-- Never fork it per project. If a project needs different checks, that belongs in
-  `<repo>/.claude/fleet.conf` as `CHECK_CMD`, not in a modified script.
-- If the repo's `.gitignore` allowlists paths under `.claude/`, add the script so it
-  stays versioned, and ignore `.claude/fleet-archive/`.
+- Never fork it per project. Per-project differences belong in
+  `<repo>/.claude/fleet.conf`, not in a modified script.
+- If the repo's `.gitignore` allowlists paths under `.claude/`, add the script and
+  `.claude/fleet-reviewer.md` so they stay versioned, and ignore
+  `.claude/fleet-archive/`.
 
 An earlier version of this pattern kept two hand-synced copies. They drifted, and a
 bug fix reached only one side — which is the whole reason the script is packaged
 rather than pasted.
 
-`herd.sh` provides: `status`, `launch`, `watch`, `report`, `archive`, `recycle`,
-`read`, `say`, `check`, `document`, `land`. Run it with no arguments for usage.
+`herd.sh` provides: `status`, `plan`, `deps`, `collisions`, `launch`, `watch`,
+`report`, `archive`, `recycle`, `read`, `say`, `check`, `review`, `document`, `pr`,
+`land`. Run it with `help` for usage.
 
-`launch` takes `--model opus|sonnet|fable` and `--effort low|medium|high|xhigh|max`.
-Choose both from the issue rather than by habit: a one-file mechanical fix does not
-need Opus at `xhigh`, and a design or data-modelling issue is badly served by less.
+`fleet.conf` keys, all optional:
+
+| key | meaning |
+|---|---|
+| `CHECK_CMD` | lint + test + build inside a lane; otherwise detected from `package.json`, `pyproject.toml`, `wally.toml`, `Cargo.toml`, `Makefile` |
+| `INSTALL_CMD` | dependency install; otherwise every detected toolchain runs (`npm ci`, `uv sync` or venv+pip, `wally install`, `cargo fetch`) and asserts its output |
+| `CODEGEN_CMD` | per-worktree codegen (`prisma generate` is detected) |
+| `REQUIRE_PLAN` | `1` (default) refuses to launch an issue with no plan comment |
+| `LAND_MODE` | `squash` (default) or `pr` |
+| `REVIEW_MODEL` | model for `review`; default `sonnet` |
+| `STALE_MIN` | idle minutes with no new commit before `watch` says stale; default 30 |
+| `LANE_MODEL`, `LANE_EFFORT` | defaults when neither the plan nor the flags say |
+
+`launch` takes `--model opus|sonnet|fable` and `--effort low|medium|high|xhigh|max`,
+and otherwise reads them from the plan's `## Lane` line. Choose both from the issue
+rather than by habit: a one-file mechanical fix does not need Opus at `xhigh`, and
+a design or data-modelling issue is badly served by less.
+
+**Several repositories, one seat.** `scripts/fleet-portfolio.sh status` and
+`report` fan the read-only commands out across every repo listed in
+`~/.claude/fleet-portfolio.conf` (`/fleet-init --portfolio` registers a repo).
+Each repo still has its own manager and its own lanes; the wrapper only lets one
+person see all of them at once.
 
 `report` reconstructs the window from git and the forge — **not** from lane
 archives. It once read only archives, which are written on teardown, and since
