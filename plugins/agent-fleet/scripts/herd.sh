@@ -702,13 +702,24 @@ start_lane_agent() {
   # `agent start` can return before the dialog has rendered, so poll for it
   # rather than reading the screen once.
   local i
-  for i in $(seq 1 15); do
-    if herdr agent read "$name" --source detection --lines 40 2>/dev/null | grep -qi "trust this folder"; then
+  local screen
+  for i in $(seq 1 20); do
+    screen="$(herdr agent read "$name" --source detection --lines 40 2>/dev/null)"
+    if printf '%s' "$screen" | grep -qi "trust this folder"; then
       echo "answering the folder-trust prompt for $name (worktree of this repository)" >&2
       herdr agent send-keys "$name" down >/dev/null 2>&1
       herdr agent send-keys "$name" enter >/dev/null 2>&1
       herdr agent wait "$name" --timeout 120000 >/dev/null 2>&1 || true
-      break
+      continue
+    fi
+    if printf '%s' "$screen" | grep -qi "New MCP server found"; then
+      # A project .mcp.json (e.g. a template's dev MCP) prompts on first start.
+      # Lanes run on the manager-approved toolset only; the highlighted default
+      # is "Continue without using this MCP server".
+      echo "declining the project MCP server prompt for $name" >&2
+      herdr agent send-keys "$name" enter >/dev/null 2>&1
+      sleep 2
+      continue
     fi
     st="$(agent_state "$name")"
     case "$st" in idle|done) return 0 ;; esac
@@ -927,6 +938,14 @@ cmd_merge() {
   [ -n "$n" ] || die "no open PR for '$b' (open one with: ./.claude/herd.sh pr $a)"
   if [ -z "$nowait" ]; then
     nchecks="$(ghr pr checks "$n" --json name -q 'length' 2>/dev/null || echo 0)"
+    # CI registers its checks a few seconds after the push. Do not mistake that
+    # gap for "this repository has no CI": poll for up to 90 s first.
+    local t
+    for t in $(seq 1 9); do
+      [ "${nchecks:-0}" -gt 0 ] && break
+      sleep 10
+      nchecks="$(ghr pr checks "$n" --json name -q 'length' 2>/dev/null || echo 0)"
+    done
     if [ "${nchecks:-0}" -gt 0 ]; then
       echo "waiting for $nchecks check(s) on #$n..." >&2
       ghr pr checks "$n" --watch --fail-fast >/dev/null 2>&1; rc=$?
@@ -967,6 +986,18 @@ cmd_pr() {
   b="$(git -C "$d" rev-parse --abbrev-ref HEAD)"
   issue="$(issue_of_branch "$b")"
   command -v gh >/dev/null 2>&1 || die "gh is not available"
+  # A previous landing attempt may already have merged this branch (for
+  # example when the manager's process was killed between merge and recycle):
+  # nothing ahead of main plus a merged PR means the only thing left is teardown.
+  local merged ahead
+  git -C "$d" fetch -q origin main 2>/dev/null || true
+  ahead="$(git -C "$d" rev-list --count origin/main..HEAD 2>/dev/null || echo 1)"
+  merged="$(ghr pr list --head "$b" --state merged --json number -q '.[0].number' 2>/dev/null)"
+  if [ "${ahead:-1}" = 0 ] && [ -n "$merged" ]; then
+    echo "#$merged for '$b' is already merged and the branch has nothing ahead of main" >&2
+    if [ "$AUTO_RECYCLE" = 1 ]; then cmd_recycle "$a"; fi
+    return 0
+  fi
   gate_for_landing "$a" "$d" "$b" "$noreview"
   # --force-with-lease because the gate may have rebased the branch; the lease
   # still refuses to overwrite anything pushed by someone else since our fetch.
@@ -992,9 +1023,16 @@ cmd_pr() {
     echo
     [ -n "$issue" ] && echo "Closes #$issue"
   } > "$body"
-  url="$(ghr pr create --base main --head "$b" --title "$title" --body-file "$body" 2>/dev/null)" \
-    || die "gh pr create failed for '$b' (a PR may already exist: gh pr view $b)"
-  echo "opened $url"
+  # Reuse an open PR from an earlier attempt rather than failing on a duplicate.
+  url="$(ghr pr list --head "$b" --state open --json url -q '.[0].url' 2>/dev/null)"
+  if [ -n "$url" ]; then
+    ghr pr edit "$url" --body-file "$body" >/dev/null 2>&1 || true
+    echo "reusing open PR $url"
+  else
+    url="$(ghr pr create --base main --head "$b" --title "$title" --body-file "$body" 2>/dev/null)" \
+      || die "gh pr create failed for '$b' (see: gh pr view $b)"
+    echo "opened $url"
+  fi
   [ -n "$issue" ] && cmd_document "$a" >/dev/null 2>&1 && echo "documented #$issue"
   if [ "$AUTO_MERGE" = 1 ] && [ -z "$nomerge" ]; then
     cmd_merge "$a"
