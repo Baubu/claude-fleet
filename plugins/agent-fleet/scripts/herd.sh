@@ -345,6 +345,8 @@ while True:
             if st not in SETTLED:
                 idle_since.pop(name, None)
                 continue
+            if landed(name, a.get("cwd") or "."):
+                continue  # merged and closed; nothing it does now is fleet news
             h = head(a.get("cwd") or ".")
             key = (name, st, h)
             if key not in seen:
