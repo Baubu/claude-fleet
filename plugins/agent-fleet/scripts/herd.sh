@@ -328,6 +328,14 @@ def landed(name, cwd):
         _closed[name] = (st, time.time())
     return st == "CLOSED"
 
+def summary_stamp(cwd):
+    # A lane that rewrote its closing summary at the same commit (a summary-only
+    # fix after review) has done new work; the commit hash alone would hide it.
+    try:
+        return int(os.stat(os.path.join(cwd, ".claude", "lane-summary.md")).st_mtime)
+    except OSError:
+        return 0
+
 SETTLED = {"idle", "done", "blocked"}
 # Announce a (lane, state, commit) combination at most once. A pane that settles,
 # wakes and settles again with no new commit is noise, and the fleet generates a
@@ -352,7 +360,7 @@ while True:
             if landed(name, a.get("cwd") or "."):
                 continue  # merged and closed; nothing it does now is fleet news
             h = head(a.get("cwd") or ".")
-            key = (name, st, h)
+            key = (name, st, h, summary_stamp(a.get("cwd") or "."))
             if key not in seen:
                 seen.add(key)
                 # blocked always speaks: it means a human is being waited on.
