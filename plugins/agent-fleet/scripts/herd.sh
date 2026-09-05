@@ -1103,6 +1103,11 @@ cmd_recycle() {
     echo "warning: '$a' wrote no summary at $dump -- archiving pane read only" >&2
   fi
   [ "$b" = main ] && die "'$a' is on main -- refusing"
+  # Toolchain churn is not lane work: wally removes an empty Packages/ (and its
+  # committed .gitkeep) on install, so restore deleted placeholders before judging.
+  git -C "$d" ls-files --deleted 2>/dev/null | grep '\.gitkeep$' | while IFS= read -r f; do
+    git -C "$d" checkout -q -- "$f" 2>/dev/null || true
+  done
   [ "$(content_dirty "$d")" = 0 ] || die "'$a' has uncommitted changes -- refusing"
   git -C "$d" rev-parse --verify --quiet "origin/$b" >/dev/null \
     || die "'$b' has never been pushed -- refusing to discard it"
