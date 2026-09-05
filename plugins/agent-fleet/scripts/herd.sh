@@ -1026,8 +1026,15 @@ cmd_recycle() {
 
   herdr worktree remove --workspace "$ws" --force >/dev/null 2>&1
   git -C "$REPO" worktree prune
+  # Herdr drops the workspace and git forgets the worktree, but the directory
+  # itself survives when it holds untracked content (a .venv, node_modules,
+  # Packages/): half a gigabyte per lane on disk for nothing. Remove it once
+  # git no longer lists it.
+  if [ -d "$d" ] && ! git -C "$REPO" worktree list --porcelain | grep -qiF "$(cd "$d" && pwd -W 2>/dev/null || pwd)"; then
+    rm -rf "$d" 2>/dev/null || warn "could not delete $d; remove it by hand"
+  fi
   git -C "$REPO" branch -D "$b" >/dev/null 2>&1
-  echo "recycled $a (workspace $ws, branch $b -- origin copy retained)"
+  echo "recycled $a (workspace $ws, branch $b -- origin copy retained, worktree dir removed)"
 }
 
 # report [since] -- what the fleet actually did, for a human catching up.
