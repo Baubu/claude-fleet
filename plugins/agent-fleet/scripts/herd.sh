@@ -15,6 +15,7 @@
 #   ./.claude/herd.sh deps <n>          # are issue <n>'s dependencies closed?
 #   ./.claude/herd.sh collisions [n..]  # files two or more planned issues both touch
 #   ./.claude/herd.sh launch <n> <slug> [name] [--model M] [--effort L] [--force] [--no-plan]
+#   ./.claude/herd.sh brief <agent>     # (re)send the opening brief to an idle lane
 #   ./.claude/herd.sh watch             # event stream of lane state changes (incl. stale)
 #   ./.claude/herd.sh report [since]    # what the fleet did, for a human catching up
 #   ./.claude/herd.sh archive <agent>   # snapshot a lane's transcript, no teardown
@@ -594,22 +595,60 @@ cmd_launch() {
     ( cd "$dir" && npx prisma generate >/dev/null 2>&1 ) || die "prisma generate failed in $dir"
   fi
 
+  start_lane_agent "$name" "$pane" "$model" "$effort" \
+    || die "agent start failed for $name -- the lane exists; once the agent is idle, send the brief with: ./.claude/herd.sh brief $name"
+
+  herdr agent prompt "$name" "$(build_brief "$issue" "$branch" "$dir")" >/dev/null \
+    || die "opening prompt failed for $name -- resend with: ./.claude/herd.sh brief $name"
+  echo "launched $name -> $pane ($branch${model:+, $model}${effort:+ $effort}${plan:+, planned}${surface:+, collisions flagged})"
+}
+
+# start_lane_agent <name> <pane> [model] [effort] -- start claude in the pane and
+# get it to an idle prompt. A brand-new worktree is a directory Claude Code has
+# never seen, so its first screen is the folder-trust dialog and `agent start`
+# returns agent_not_ready. That dialog is answered here -- the worktree is a
+# checkout of the manager's own repository -- and nothing else is: any other
+# blocking UI is left for a human, per manager discipline.
+start_lane_agent() {
+  local name="$1" pane="$2" model="${3:-}" effort="${4:-}" rc=0 st
   local -a args=()
   [ -n "$model" ]  && args+=(--model "$model")
   [ -n "$effort" ] && args+=(--effort "$effort")
+  echo "starting $name (${model:-default model}, ${effort:-default effort})" >&2
   if [ ${#args[@]} -gt 0 ]; then
-    echo "starting $name (${model:-default model}, ${effort:-default effort})" >&2
-    herdr agent start "$name" --kind claude --pane "$pane" --timeout 120000 -- "${args[@]}" >/dev/null \
-      || die "agent start failed for $name"
+    herdr agent start "$name" --kind claude --pane "$pane" --timeout 120000 -- "${args[@]}" >/dev/null 2>&1 || rc=$?
   else
-    herdr agent start "$name" --kind claude --pane "$pane" --timeout 120000 >/dev/null \
-      || die "agent start failed for $name"
+    herdr agent start "$name" --kind claude --pane "$pane" --timeout 120000 >/dev/null 2>&1 || rc=$?
   fi
+  [ $rc -eq 0 ] && return 0
+  if herdr agent read "$name" --source detection --lines 40 2>/dev/null | grep -qi "trust this folder"; then
+    echo "answering the folder-trust prompt for $name (worktree of this repository)" >&2
+    herdr agent send-keys "$name" down >/dev/null 2>&1
+    herdr agent send-keys "$name" enter >/dev/null 2>&1
+    herdr agent wait "$name" --timeout 120000 >/dev/null 2>&1 || true
+  fi
+  st="$(agent_state "$name")"
+  case "$st" in idle|done) return 0 ;; esac
+  warn "$name is '$st' after start; screen follows"
+  herdr agent read "$name" --source visible --lines 30 2>/dev/null | grep -v '^[[:space:]]*$' | tail -15 >&2
+  return 1
+}
 
-  # The brief. With a plan, the lane's first action is to read it and confirm
-  # the file list; without one, it declares its own so the manager can still
-  # derive the collision surface.
-  local checkcmd brief
+agent_state() {
+  herdr agent get "$1" 2>/dev/null | python -c '
+import sys, json
+try: print(json.loads(sys.stdin.buffer.read().decode("utf-8","replace"))["result"]["agent"]["agent_status"])
+except Exception: print("unknown")'
+}
+
+# build_brief <issue> <branch> <dir> -- the lane's opening prompt, as text.
+# With a plan, the lane's first action is to read it and confirm the file list;
+# without one, it declares its own so the manager can still derive the
+# collision surface.
+build_brief() {
+  local issue="$1" branch="$2" dir="$3" plan surface checkcmd brief
+  plan="$(plan_of "$issue")"
+  surface="$(cmd_collisions "$issue" 2>/dev/null || true)"
   checkcmd="$(check_cmd_for "$dir")"
   brief="You are working solo in a git worktree on branch $branch. Never leave this directory, never checkout or commit to main. Other agents are working in parallel worktrees on this same repo. Read CLAUDE.md and follow it strictly."
   if [ -n "$plan" ]; then
@@ -627,9 +666,21 @@ cmd_launch() {
     brief="$brief Before you write your summary, run the project's checks yourself: $checkcmd -- and record the exact result under '## Verified'. Do not report done with failing checks; fix them first."
   fi
   brief="$brief Commit to this branch with a conventional commit message ending in 'Closes #$issue'. When done, write your closing summary to .claude/lane-summary.md in this worktree, with the headings '## What was done', '## Deviations from plan', '## Still needs a human' and '## Verified' -- that file is posted verbatim as a comment on issue #$issue, so write it for the repository owner rather than for me. Say what you could NOT verify rather than omitting it; write 'none' under 'Deviations from plan' and 'nothing' under 'Still needs a human' if that is genuinely true. Then reply with the same summary in the pane."
+  printf '%s' "$brief"
+}
 
-  herdr agent prompt "$name" "$brief" >/dev/null || die "opening prompt failed for $name"
-  echo "launched $name -> $pane ($branch${model:+, $model}${effort:+ $effort}${plan:+, planned}${surface:+, collisions flagged})"
+# brief <agent> -- (re)send the opening brief to a lane whose launch was
+# interrupted after the worktree existed. Refuses while the agent is blocked.
+cmd_brief() {
+  local a="$1" d b issue st
+  d="$(wt_of "$a")"; [ -n "$d" ] && [ -d "$d" ] || die "no worktree for agent '$a'"
+  b="$(git -C "$d" rev-parse --abbrev-ref HEAD)"
+  issue="$(issue_of_branch "$b")"
+  [ -n "$issue" ] || die "cannot derive an issue number from branch '$b'"
+  st="$(agent_state "$a")"
+  case "$st" in idle|done) ;; *) die "'$a' is '$st' -- unblock it first (herdr agent read $a)" ;; esac
+  herdr agent prompt "$a" "$(build_brief "$issue" "$b" "$d")" >/dev/null || die "prompt failed for $a"
+  echo "briefed $a for #$issue"
 }
 
 # ---------------------------------------------------------------------------
@@ -920,6 +971,7 @@ case "${1:-status}" in
   deps)   shift; [ $# -ge 1 ] || die "deps needs <issue>"; cmd_deps "$1" ;;
   collisions) shift; cmd_collisions "$@" ;;
   launch) shift; [ $# -ge 2 ] || die "launch needs <issue> <slug> [name] [--model M] [--effort L] [--force] [--no-plan]"; cmd_launch "$@" ;;
+  brief)  shift; [ $# -ge 1 ] || die "brief needs an agent"; cmd_brief "$1" ;;
   report) shift; cmd_report "$@" ;;
   archive) shift; [ $# -ge 1 ] || die "archive needs an agent"; cmd_archive "$1" ;;
   recycle) shift; [ $# -ge 1 ] || die "recycle needs an agent"; cmd_recycle "$1" ;;

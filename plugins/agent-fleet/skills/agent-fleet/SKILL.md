@@ -557,9 +557,16 @@ An earlier version of this pattern kept two hand-synced copies. They drifted, an
 bug fix reached only one side — which is the whole reason the script is packaged
 rather than pasted.
 
-`herd.sh` provides: `status`, `plan`, `deps`, `collisions`, `launch`, `watch`,
-`report`, `archive`, `recycle`, `read`, `say`, `check`, `review`, `document`, `pr`,
-`land`. Run it with `help` for usage.
+`herd.sh` provides: `status`, `plan`, `deps`, `collisions`, `launch`, `brief`,
+`watch`, `report`, `archive`, `recycle`, `read`, `say`, `check`, `review`,
+`document`, `pr`, `land`. Run it with `help` for usage.
+
+A brand-new worktree is a directory Claude Code has never seen, so the lane's
+first screen is the folder-trust dialog. `launch` answers that one dialog itself —
+the worktree is a checkout of the manager's own repository — and no other: any
+other blocking UI at startup is reported with the screen and left for you. If a
+launch is interrupted after the worktree exists, do not relaunch; unblock the
+agent and `brief <agent>` resends the opening prompt.
 
 `fleet.conf` keys, all optional:
 
