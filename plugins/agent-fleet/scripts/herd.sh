@@ -277,7 +277,7 @@ for a in sorted(rows, key=lambda r: r["pane_id"]):
 # lanes all emit, otherwise a crashed or quietly-given-up lane is
 # indistinguishable from a working one.
 cmd_watch() {
-  HERD_STALE_MIN="$STALE_MIN" HERD_WT="$WT" python -u -c '
+  HERD_STALE_MIN="$STALE_MIN" HERD_WT="$WT" HERD_REPO="$REPO" python -u -c '
 import json, subprocess, time, os
 
 STALE = float(os.environ.get("HERD_STALE_MIN") or 30) * 60
@@ -308,6 +308,23 @@ def poll():
 def head(cwd):
     return sh(["git", "-C", cwd, "rev-parse", "--short", "HEAD"]) or "?"
 
+# A landed lane is not recycled by default, so it sits idle forever and would
+# be reported stale every STALE window. Its issue is closed; check that at most
+# once per ten minutes per lane and stop treating it as a live lane.
+import re as _re
+REPO = os.environ.get("HERD_REPO") or "."
+_closed = {}
+def landed(name, cwd):
+    m = _re.search(r"issue-(\d+)-", os.path.basename(cwd.rstrip("/\\")))
+    if not m:
+        return False
+    st, t = _closed.get(name, (None, 0))
+    if time.time() - t > 600:
+        out = sh(["gh", "issue", "view", m.group(1), "--json", "state", "-q", ".state"], cwd=REPO)
+        st = (out or st or "OPEN").strip()
+        _closed[name] = (st, time.time())
+    return st == "CLOSED"
+
 SETTLED = {"idle", "done", "blocked"}
 # Announce a (lane, state, commit) combination at most once. A pane that settles,
 # wakes and settles again with no new commit is noise, and the fleet generates a
@@ -335,7 +352,7 @@ while True:
                 # blocked always speaks: it means a human is being waited on.
                 if not (first and st == "idle"):
                     print("LANE %s -> %s @%s (pane %s)" % (name, st, h, a["pane_id"]))
-            if st == "idle":
+            if st == "idle" and not landed(name, a.get("cwd") or "."):
                 ph, t0 = idle_since.get(name, (None, now))
                 if ph != h:
                     idle_since[name] = (h, now)
@@ -571,6 +588,16 @@ cmd_launch() {
     esac
   done
   name="${name:-$slug}"
+  # Agent names are unique across the whole Herdr session, not per repository.
+  # Two fleets that both launch a "docs" lane collide: the second start fails
+  # and every later command addressed to "docs" lands on the first repo's lane.
+  # Prefer the plain slug; fall back to slug-issue, then to repo-slug.
+  if agent_name_taken "$name"; then
+    if ! agent_name_taken "${slug}-${issue}"; then name="${slug}-${issue}"
+    elif ! agent_name_taken "$(basename "$REPO" | tr -cd 'a-z0-9-' | cut -c1-12)-${slug}"; then name="$(basename "$REPO" | tr -cd 'a-z0-9-' | cut -c1-12)-${slug}"
+    else die "agent name '$name' is taken in this Herdr session; pass a unique [name]"; fi
+    warn "agent name '$slug' is taken in this Herdr session; using '$name'"
+  fi
   local branch="issue-${issue}-${slug}" dir
   dir="$WT/issue-${issue}-${slug}"
   [ -e "$dir" ] && die "lane already exists at $dir"
@@ -676,6 +703,16 @@ start_lane_agent() {
   warn "$name is '$st' after start; screen follows"
   herdr agent read "$name" --source visible --lines 30 2>/dev/null | grep -v '^[[:space:]]*$' | tail -15 >&2
   return 1
+}
+
+agent_name_taken() {
+  herdr agent list 2>/dev/null | N="$1" python -c '
+import sys, json, os
+try:
+    names = {a.get("name") for a in json.loads(sys.stdin.buffer.read().decode("utf-8","replace"))["result"]["agents"]}
+except Exception:
+    names = set()
+sys.exit(0 if os.environ["N"] in names else 1)'
 }
 
 agent_state() {
