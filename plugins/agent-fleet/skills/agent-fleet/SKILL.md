@@ -462,12 +462,18 @@ does this itself (`AUTO_RECYCLE=1`), and `recycle <agent>` does it for anything
 merged by hand. Do not keep finished panes around in case a follow-up question
 comes up.
 
-The transcript survives teardown regardless — it lives under `~/.claude/projects/`
-keyed by the worktree path, and outlives both the pane and the directory — and the
-closing summary is already on the issue and in the archive. If a follow-up is
-genuinely needed, resume the session from the archive's recorded command rather
-than paying for an idle pane on the chance. The archive records the Claude session
-id and the exact resume command:
+**Recycling never deletes the conversation.** The transcript lives under
+`~/.claude/projects/` keyed by the worktree path and outlives both the pane and
+the directory; the closing summary is already on the issue and in the archive; and
+the archive records the Claude session id. To come back to a closed lane with all
+its context:
+
+```bash
+./.claude/herd.sh resume <agent>   # recreates the worktree, opens a pane, claude --resume <session>
+```
+
+Recycle it again when the follow-up is done. The archive also records the manual
+form of the same thing:
 
 ```bash
 git worktree add "<worktree-path>" <branch>
@@ -570,8 +576,8 @@ bug fix reached only one side — which is the whole reason the script is packag
 rather than pasted.
 
 `herd.sh` provides: `status`, `plan`, `deps`, `collisions`, `launch`, `brief`,
-`watch`, `report`, `archive`, `recycle`, `read`, `say`, `check`, `review`,
-`document`, `pr`, `merge`, `land`. Run it with `help` for usage.
+`watch`, `report`, `archive`, `recycle`, `resume`, `read`, `say`, `check`,
+`review`, `document`, `pr`, `merge`, `land`. Run it with `help` for usage.
 
 A brand-new worktree is a directory Claude Code has never seen, so the lane's
 first screen is the folder-trust dialog. `launch` answers that one dialog itself —

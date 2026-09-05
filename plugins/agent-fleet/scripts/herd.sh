@@ -19,7 +19,8 @@
 #   ./.claude/herd.sh watch             # event stream of lane state changes (incl. stale)
 #   ./.claude/herd.sh report [since]    # what the fleet did, for a human catching up
 #   ./.claude/herd.sh archive <agent>   # snapshot a lane's transcript, no teardown
-#   ./.claude/herd.sh recycle <agent>   # archive, then retire a fully-pushed lane
+#   ./.claude/herd.sh recycle <agent>   # archive, then retire a fully-pushed lane (chat is kept)
+#   ./.claude/herd.sh resume <agent>    # reopen a recycled lane's chat in a new pane, context intact
 #   ./.claude/herd.sh read <agent> [n]  # last n lines of an agent's transcript
 #   ./.claude/herd.sh say <agent> <txt> # prompt an agent
 #   ./.claude/herd.sh check <agent>     # lint+test+build that agent's worktree
@@ -337,6 +338,7 @@ prev = set()
 # idle_since[name] = (head, time first seen idle at that head). A lane idle for
 # STALE seconds with no new commit has probably given up without saying so.
 idle_since = {}
+last_cwd = {}
 first = True
 while True:
     cur = poll()
@@ -366,9 +368,14 @@ while True:
                           % (name, int((now - t0) // 60), h, a["pane_id"]))
         for name in sorted(prev - set(cur)):
             idle_since.pop(name, None)
-            if _closed.get(name, (None, 0))[0] == "CLOSED":
+            # Re-check the issue: it was open when the lane settled and has
+            # usually been closed by the merge that recycled the lane since.
+            _closed.pop(name, None)
+            if landed(name, last_cwd.get(name, ".")):
                 continue  # recycled after merge; expected
             print("LANE %s -> vanished (pane closed or agent exited)" % name)
+        for name, a in cur.items():
+            last_cwd[name] = a.get("cwd") or "."
         prev = set(cur)
         first = False
     time.sleep(20)
@@ -417,7 +424,7 @@ except Exception: pass')"
     echo
     echo "Transcript on disk (readable without resuming):"
     echo '```'
-    echo "~/.claude/projects/$(echo "$d" | sed 's|[:/\.]|-|g')/${sid:-<session-id>}.jsonl"
+    echo "~/.claude/projects/$(echo "$d" | sed 's|[:/\\._]|-|g')/${sid:-<session-id>}.jsonl"
     echo '```'
     echo
     echo "## Commits"
@@ -679,9 +686,12 @@ cmd_launch() {
 # blocking UI is left for a human, per manager discipline.
 start_lane_agent() {
   local name="$1" pane="$2" model="${3:-}" effort="${4:-}" rc=0 st
+  shift 4 2>/dev/null || shift $#
   local -a args=()
   [ -n "$model" ]  && args+=(--model "$model")
   [ -n "$effort" ] && args+=(--effort "$effort")
+  [ $# -gt 0 ] && args+=("$@")   # extra claude args, e.g. --resume <session>
+  [ ${#args[@]} -gt 0 ] || args=()
   echo "starting $name (${model:-default model}, ${effort:-default effort})" >&2
   if [ ${#args[@]} -gt 0 ]; then
     herdr agent start "$name" --kind claude --pane "$pane" --timeout 120000 -- "${args[@]}" >/dev/null 2>&1 || rc=$?
@@ -754,6 +764,38 @@ build_brief() {
   fi
   brief="$brief Commit to this branch with a conventional commit message ending in 'Closes #$issue'. When done, write your closing summary to .claude/lane-summary.md in this worktree, with the headings '## What was done', '## Deviations from plan', '## Still needs a human' and '## Verified' -- that file is posted verbatim as a comment on issue #$issue, so write it for the repository owner rather than for me. Say what you could NOT verify rather than omitting it; write 'none' under 'Deviations from plan' and 'nothing' under 'Still needs a human' if that is genuinely true. Then reply with the same summary in the pane."
   printf '%s' "$brief"
+}
+
+# resume <agent> -- reopen a recycled lane's conversation. The pane was closed
+# to give the memory back; the chat was never deleted. This recreates the
+# worktree from the retained origin branch, opens a pane on it, and starts
+# claude with --resume on the session id the archive recorded, so the agent
+# comes back with all its context.
+cmd_resume() {
+  local a="$1" arch sid b d pane
+  arch="$(ls -t "$ARCHIVE"/"$a"-*-[0-9]*T[0-9]*Z.md 2>/dev/null | head -1)"
+  [ -n "$arch" ] || die "no archive for '$a' under $ARCHIVE (was it ever recycled?)"
+  sid="$(sed -n 's/^- claude session: `\(.*\)`$/\1/p' "$arch" | head -1)"
+  b="$(sed -n 's/^- branch: `\(.*\)`$/\1/p' "$arch" | head -1)"
+  d="$(sed -n 's/^- worktree: `\(.*\)`$/\1/p' "$arch" | head -1)"
+  [ -n "$sid" ] && [ "$sid" != unknown ] || die "archive $arch records no session id"
+  [ -n "$b" ] && [ -n "$d" ] || die "archive $arch is missing branch or worktree"
+  d="$(printf '%s' "$d" | sed 's|\\|/|g')"
+  if [ ! -d "$d" ]; then
+    git -C "$REPO" fetch -q origin
+    if git -C "$REPO" rev-parse --verify --quiet "$b" >/dev/null; then
+      git -C "$REPO" worktree add -q "$d" "$b" || die "could not recreate worktree $d"
+    else
+      git -C "$REPO" worktree add -q -b "$b" "$d" "origin/$b" || die "could not recreate worktree $d from origin/$b"
+    fi
+  fi
+  agent_name_taken "$a" && die "agent name '$a' is in use; recycle or rename it first"
+  pane=$(herdr worktree open --cwd "$REPO" --path "$d" --label "resumed $a" --no-focus 2>/dev/null \
+    | python -c 'import sys,json;print(json.loads(sys.stdin.buffer.read().decode("utf-8","replace"))["result"]["root_pane"]["pane_id"])')
+  [ -n "$pane" ] || die "herdr worktree open returned no pane for $d"
+  start_lane_agent "$a" "$pane" "" "" --resume "$sid" \
+    || die "claude did not come up in $pane; open it and run: claude --resume $sid"
+  echo "resumed $a -> $pane ($b, session $sid). Recycle it again when you are done: ./.claude/herd.sh recycle $a"
 }
 
 # brief <agent> -- (re)send the opening brief to a lane whose launch was
@@ -1148,6 +1190,7 @@ case "${1:-status}" in
   collisions) shift; cmd_collisions "$@" ;;
   launch) shift; [ $# -ge 2 ] || die "launch needs <issue> <slug> [name] [--model M] [--effort L] [--force] [--no-plan]"; cmd_launch "$@" ;;
   brief)  shift; [ $# -ge 1 ] || die "brief needs an agent"; cmd_brief "$1" ;;
+  resume) shift; [ $# -ge 1 ] || die "resume needs an agent"; cmd_resume "$1" ;;
   report) shift; cmd_report "$@" ;;
   archive) shift; [ $# -ge 1 ] || die "archive needs an agent"; cmd_archive "$1" ;;
   recycle) shift; [ $# -ge 1 ] || die "recycle needs an agent"; cmd_recycle "$1" ;;

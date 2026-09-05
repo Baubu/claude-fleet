@@ -45,7 +45,8 @@ Requires [Herdr](https://herdr.dev) (`HERDR_ENV=1`) and a git repository.
 ./.claude/herd.sh watch             # event stream of lane state changes (incl. stale)
 ./.claude/herd.sh report [since]    # what the fleet did, for a human catching up
 ./.claude/herd.sh archive <agent>   # snapshot a lane's transcript, no teardown
-./.claude/herd.sh recycle <agent>   # archive, then retire a fully-pushed lane
+./.claude/herd.sh recycle <agent>   # archive, then retire a fully-pushed lane (the chat is kept)
+./.claude/herd.sh resume <agent>    # reopen a recycled lane's chat in a new pane, context intact
 ./.claude/herd.sh read <agent> [n]  # last n lines of an agent's transcript
 ./.claude/herd.sh say <agent> <txt> # prompt an agent
 ./.claude/herd.sh check <agent>     # lint + test + build that agent's worktree
@@ -143,7 +144,8 @@ Each of these cost real time before it was written down.
   It had not.
 - **Recycle the moment a feature is merged.** An open pane is a running agent and
   holds roughly 200 MB whether it is working or finished. `merge` recycles the lane
-  itself; the transcript and summary survive teardown, so nothing is lost.
+  itself. The conversation is never deleted: `resume <agent>` reopens it with its
+  context intact.
 - **Keep working; escalate rarely.** Merging green PRs, rebasing, filing issues and
   opening lanes are the manager's job, not requests — never end a landing by asking
   the owner to merge. Escalate only what is irreversible and user-visible, a
