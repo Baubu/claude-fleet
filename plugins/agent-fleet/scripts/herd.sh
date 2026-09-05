@@ -783,12 +783,32 @@ PLAN>>>"
   return $rc
 }
 
+# rebase_onto_main <agent> <worktree> <branch> -- a lane that finished after
+# sibling lanes merged is behind main, and its PR will be CONFLICTING on the
+# forge no matter how green it is locally. Rebase here, before the checks, so
+# the checks run on what will actually merge. A clean rebase is silent; a
+# conflicting one is aborted and handed to the lane that wrote the code, since
+# it holds the context to resolve it.
+rebase_onto_main() {
+  local a="$1" d="$2" b="$3" behind conflicts
+  git -C "$d" fetch -q origin 2>/dev/null
+  behind="$(git -C "$d" rev-list --count HEAD..origin/main 2>/dev/null || echo 0)"
+  [ "${behind:-0}" -gt 0 ] || return 0
+  echo "rebasing '$b' onto origin/main ($behind commits behind)..." >&2
+  if git -C "$d" rebase -q origin/main >/dev/null 2>&1; then return 0; fi
+  conflicts="$(git -C "$d" diff --name-only --diff-filter=U | tr '\n' ' ')"
+  git -C "$d" rebase --abort >/dev/null 2>&1
+  herdr agent prompt "$a" "Your branch $b is $behind commits behind origin/main and rebasing it conflicts in: $conflicts. Run 'git fetch origin && git rebase origin/main', resolve every conflict keeping both sides' intent (regenerate lockfiles with the toolchain instead of hand-merging them), re-run the project's checks, finish the rebase, and update .claude/lane-summary.md. Do not force-push; the manager will. Reply with what you resolved." >/dev/null 2>&1
+  die "rebase of '$b' conflicts in: $conflicts -- sent to the lane; land again when it reports done"
+}
+
 # gate_for_landing <agent> <worktree> <branch> [--no-review]
 # Everything both `land` and `pr` require before touching main or the forge.
 gate_for_landing() {
   local a="$1" d="$2" b="$3" noreview="${4:-}" rc
   [ "$b" = main ] && die "'$a' is on main -- refusing"
   [ "$(content_dirty "$d")" = 0 ] || die "'$a' has uncommitted changes; commit or stash first"
+  rebase_onto_main "$a" "$d" "$b"
   cmd_check "$a" || die "checks failed for '$a' -- not landing"
   if [ -z "$noreview" ]; then
     cmd_review "$a"; rc=$?
@@ -857,7 +877,9 @@ cmd_pr() {
   issue="$(issue_of_branch "$b")"
   command -v gh >/dev/null 2>&1 || die "gh is not available"
   gate_for_landing "$a" "$d" "$b" "$noreview"
-  git -C "$d" push -u origin "$b" >/dev/null 2>&1 || die "push of '$b' failed"
+  # --force-with-lease because the gate may have rebased the branch; the lease
+  # still refuses to overwrite anything pushed by someone else since our fetch.
+  git -C "$d" push -u --force-with-lease origin "$b" >/dev/null 2>&1 || die "push of '$b' failed"
   title="$(git -C "$d" log --reverse --format=%s origin/main..HEAD | head -1)"
   [ -n "$title" ] || title="$b"
   mkdir -p "$ARCHIVE"
