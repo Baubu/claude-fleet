@@ -515,9 +515,13 @@ content change. That blocks rebases and makes every "is this tree clean?" gate
 unreliable. Use `git diff --numstat`, which compares content after normalisation,
 and fix the root cause with `* text=auto` in `.gitattributes`.
 
-**Decode subprocess output explicitly.** On Windows, Python defaults to the ANSI
-codepage, so reading multiplexer JSON crashes on the first non-ASCII agent title.
-Decode UTF-8 with a replacement policy.
+**Decode subprocess output explicitly, and encode it too.** On Windows, Python
+defaults to the ANSI codepage in both directions: reading multiplexer JSON crashes
+on the first non-ASCII agent title, and *printing* a plan that contains an arrow
+raises `UnicodeEncodeError` on the way out. When that print sits inside a helper
+whose exceptions are swallowed, the symptom is a lie — "no fleet plan on #2" for a
+plan that is plainly on the issue. `herd.sh` exports `PYTHONUTF8=1` for every child
+process; do the same in anything you add.
 
 **Tear the lane down before deleting its branch.** A worktree holds a checkout of
 its branch, so `--delete-branch` on a merge fails while the lane exists. Recycle

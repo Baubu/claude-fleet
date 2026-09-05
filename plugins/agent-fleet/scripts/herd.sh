@@ -43,6 +43,14 @@
 # Agent names are set at `herdr agent start` time and follow the pane.
 set -uo pipefail
 
+# Every python helper below prints text that came from the forge or from an
+# agent: plans, issue bodies, titles. On Windows, Python's stdout defaults to
+# the ANSI code page, and the first character outside it (an arrow in a plan,
+# a Hebrew title) raises UnicodeEncodeError inside a helper whose failure is
+# swallowed -- which surfaced as "no fleet plan on #2" for a plan that was
+# plainly there. Force UTF-8 in both directions for every child process.
+export PYTHONUTF8=1 PYTHONIOENCODING=utf-8
+
 REPO="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
 WT="$REPO/.claude/worktrees"
 ARCHIVE="$REPO/.claude/fleet-archive"
