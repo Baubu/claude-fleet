@@ -51,9 +51,16 @@ Requires [Herdr](https://herdr.dev) (`HERDR_ENV=1`) and a git repository.
 ./.claude/herd.sh check <agent>     # lint + test + build that agent's worktree
 ./.claude/herd.sh review <agent>    # independent headless review; verdict to the issue
 ./.claude/herd.sh document <agent>  # post the lane's summary to its issue
-./.claude/herd.sh pr <agent>        # check, review, push, open a PR with evidence
-./.claude/herd.sh land <agent>      # check, review, summary, then squash (or --pr)
+./.claude/herd.sh pr <agent>        # check, review, push, open a PR with evidence, merge when CI is green
+./.claude/herd.sh merge <agent>     # wait for the PR's checks, squash-merge, update main
+./.claude/herd.sh land <agent>      # check, review, summary, then squash (or --pr: PR + merge)
 ```
+
+**The manager merges.** Nothing in the flow ends with "someone please click
+merge": once the manager's re-run checks, the independent review, the closing
+summary and CI are green, `land` merges (`AUTO_MERGE=1`). The owner is escalated to
+only for the irreversible — migrations, spend, user-visible changes — and for
+blocked dialogs.
 
 **The manager plans, the lane implements.** `plan` posts a six-heading plan
 (approach, files, interfaces, tests, out of scope, lane sizing) as an issue comment;
@@ -70,12 +77,13 @@ files, and the exact check command to run before reporting done.
 
 `land` runs the checks, then an independent headless review on a cheaper model,
 then requires the lane's closing summary, then stages a squash — or, with
-`LAND_MODE=pr` in `.claude/fleet.conf`, pushes and opens a PR whose body carries the
-summary, the manager's re-run check output and the review verdict.
+`LAND_MODE=pr` in `.claude/fleet.conf`, pushes, opens a PR whose body carries the
+summary, the manager's re-run check output and the review verdict, waits for CI,
+and merges it.
 
 `.claude/fleet.conf` keys: `CHECK_CMD`, `INSTALL_CMD`, `CODEGEN_CMD`,
-`REQUIRE_PLAN`, `LAND_MODE`, `REVIEW_MODEL`, `STALE_MIN`, `LANE_MODEL`,
-`LANE_EFFORT`. All optional; see the skill for each.
+`REQUIRE_PLAN`, `LAND_MODE`, `AUTO_MERGE`, `REVIEW_MODEL`, `STALE_MIN`,
+`LANE_MODEL`, `LANE_EFFORT`. All optional; see the skill for each.
 
 ## A typical cycle
 
@@ -136,9 +144,10 @@ Each of these cost real time before it was written down.
 - **Recycle only when something forces it.** The transcript survives teardown; the
   live pane, where you can still ask a follow-up, does not.
 - **Keep working; escalate rarely.** Merging green PRs, rebasing, filing issues and
-  opening lanes are the manager's job, not requests. Escalate only what is
-  irreversible and user-visible, a blocked lane, a real product decision, or a
-  safety refusal. Run `herd.sh report` when you stop, so the day is reconstructable.
+  opening lanes are the manager's job, not requests — never end a landing by asking
+  the owner to merge. Escalate only what is irreversible and user-visible, a
+  blocked lane, a real product decision, or a safety refusal. Run `herd.sh report`
+  when you stop, so the day is reconstructable.
 - **`blocked` escalates to the human.** A blocked lane is sitting on an approval or
   question dialog. Read it and ask — never answer it on the lane's behalf.
 

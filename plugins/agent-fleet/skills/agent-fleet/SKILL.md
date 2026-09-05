@@ -220,12 +220,16 @@ everything that is not.
 - **`blocked` escalates to the human.** A blocked agent is sitting on a permission
   or question dialog. Read it and ask. A manager that auto-answers approval prompts
   on behalf of three other agents is a manager that approves something destructive.
-- **Merge authority is the user's to set, and worth asking about once.** Default to
-  staging squashes and letting a person land `main`; if the user grants merge
-  rights, use them and land lanes one at a time, re-running checks after each, so a
-  conflict has one obvious author. Either way, keep a human gate on the genuinely
-  irreversible: applying migrations, reseeding live data, anything that changes what
-  users see. Say what the change will look like to a user before doing it.
+- **The manager merges. Never hand a merge back to the person.** The owner's job is
+  to do as little as possible; a landing that stops at "PR open, please click merge"
+  has moved the last step back onto them, which is the opposite of the point. The
+  gates are the checks you re-ran, the independent review, the closing summary and
+  CI. Once those are green, merge — `land` in PR mode does this itself
+  (`AUTO_MERGE=1`), and `merge <agent>` does it for a PR opened earlier. Land lanes
+  one at a time, re-running checks after each, so a conflict has one obvious
+  author. Keep a human gate only on the genuinely irreversible: applying migrations,
+  reseeding live data, spending money, anything that changes what users see. Say
+  what the change will look like to a user before doing it.
 - **Prefer waiting to polling.** `herdr agent wait <name> --until blocked` and
   `--wait` on prompts are event-driven. A status loop on a short timer burns tokens
   across every lane at once for no new information.
@@ -419,11 +423,12 @@ shared state:
   summary is captured *before* the merge, while the agent that knows the answers is
   still alive and holding its context.
 - **Prefer a pull request when the repo has CI.** `LAND_MODE=pr` in `fleet.conf`
-  (or `land --pr`) makes `land` push the branch and open a PR whose body is the
+  (or `land --pr`) makes `land` push the branch, open a PR whose body is the
   lane's summary plus the manager's own re-run check output and the review verdict,
-  ending in `Closes #n`. CI becomes a second gate and the PR is the durable record.
-  The default stays the staged squash, because not every repo has a remote worth
-  gating on.
+  ending in `Closes #n`, then wait for CI and merge it. CI becomes a second gate
+  and the PR is the durable record — but the merge is still the manager's, not the
+  owner's. The default stays the staged squash, because not every repo has a
+  remote worth gating on.
 
   Do not treat this as paperwork. A fleet that closes seventeen issues in a week and
   comments on none of them has produced a repository its owner cannot read: the work
@@ -559,7 +564,7 @@ rather than pasted.
 
 `herd.sh` provides: `status`, `plan`, `deps`, `collisions`, `launch`, `brief`,
 `watch`, `report`, `archive`, `recycle`, `read`, `say`, `check`, `review`,
-`document`, `pr`, `land`. Run it with `help` for usage.
+`document`, `pr`, `merge`, `land`. Run it with `help` for usage.
 
 A brand-new worktree is a directory Claude Code has never seen, so the lane's
 first screen is the folder-trust dialog. `launch` answers that one dialog itself —
@@ -577,6 +582,7 @@ agent and `brief <agent>` resends the opening prompt.
 | `CODEGEN_CMD` | per-worktree codegen (`prisma generate` is detected) |
 | `REQUIRE_PLAN` | `1` (default) refuses to launch an issue with no plan comment |
 | `LAND_MODE` | `squash` (default) or `pr` |
+| `AUTO_MERGE` | `1` (default): in `pr` mode, wait for CI and merge; the manager merges, not a person |
 | `REVIEW_MODEL` | model for `review`; default `sonnet` |
 | `STALE_MIN` | idle minutes with no new commit before `watch` says stale; default 30 |
 | `LANE_MODEL`, `LANE_EFFORT` | defaults when neither the plan nor the flags say |

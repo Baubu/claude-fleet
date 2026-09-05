@@ -25,8 +25,9 @@
 #   ./.claude/herd.sh check <agent>     # lint+test+build that agent's worktree
 #   ./.claude/herd.sh review <agent>    # independent headless review; verdict to the issue
 #   ./.claude/herd.sh document <agent>  # post the lane's summary to its issue
-#   ./.claude/herd.sh pr <agent>        # check, review, push, open a PR with evidence
-#   ./.claude/herd.sh land <agent> [--pr] [--no-review]   # check, review, summary, then squash (or PR)
+#   ./.claude/herd.sh pr <agent>        # check, review, push, open a PR with evidence, merge when CI is green
+#   ./.claude/herd.sh merge <agent>     # wait for the PR's checks, squash-merge it, update main
+#   ./.claude/herd.sh land <agent> [--pr] [--no-review] [--no-merge]   # check, review, summary, then squash (or PR + merge)
 #
 # fleet.conf keys (all optional):
 #   CHECK_CMD      lint + test + build command run inside a lane
@@ -34,6 +35,7 @@
 #   CODEGEN_CMD    per-worktree codegen (ORM clients etc.)
 #   REQUIRE_PLAN   1 (default): launch refuses an issue that has no fleet plan comment
 #   LAND_MODE      squash (default) | pr
+#   AUTO_MERGE     1 (default): in pr mode, land/pr wait for CI and merge -- the manager merges, not a person
 #   REVIEW_MODEL   model for `review` (default sonnet)
 #   STALE_MIN      minutes idle with no new commit before `watch` says stale (default 30)
 #   LANE_MODEL / LANE_EFFORT   defaults for launch when the plan and flags say nothing
@@ -59,6 +61,7 @@ load_conf() {
   [ -f "$conf" ] && . "$conf"
   REQUIRE_PLAN="${REQUIRE_PLAN:-1}"
   LAND_MODE="${LAND_MODE:-squash}"
+  AUTO_MERGE="${AUTO_MERGE:-1}"
   REVIEW_MODEL="${REVIEW_MODEL:-sonnet}"
   STALE_MIN="${STALE_MIN:-30}"
   LANE_MODEL="${LANE_MODEL:-}"
@@ -760,12 +763,53 @@ gate_for_landing() {
   capture_summary "$a" "$d" || die "'$a' wrote no closing summary -- not landing an undocumented merge"
 }
 
-# pr <agent> [--no-review] -- push the lane and open a pull request whose body
-# carries the lane's summary plus the manager's own verification, so CI and a
-# human can gate it. Nothing touches main.
+# merge <agent> [--no-wait] -- wait for the lane's PR checks, squash-merge it,
+# and fast-forward the manager's main checkout.
+#
+# The manager merges. Landing that stops at "PR open, someone please click" has
+# moved the last step back onto the person, which is the opposite of the point.
+# The gates are the checks re-run here, the independent review, the closing
+# summary and CI; once those are green there is nothing left for a human to add.
+cmd_merge() {
+  local a="$1"; shift
+  local nowait=""; [ "${1:-}" = "--no-wait" ] && nowait=1
+  local d b n rc nchecks
+  d="$(wt_of "$a")"; [ -n "$d" ] && [ -d "$d" ] || die "no worktree for agent '$a'"
+  b="$(git -C "$d" rev-parse --abbrev-ref HEAD)"
+  command -v gh >/dev/null 2>&1 || die "gh is not available"
+  n="$(ghr pr list --head "$b" --state open --json number -q '.[0].number' 2>/dev/null)"
+  [ -n "$n" ] || die "no open PR for '$b' (open one with: ./.claude/herd.sh pr $a)"
+  if [ -z "$nowait" ]; then
+    nchecks="$(ghr pr checks "$n" --json name -q 'length' 2>/dev/null || echo 0)"
+    if [ "${nchecks:-0}" -gt 0 ]; then
+      echo "waiting for $nchecks check(s) on #$n..." >&2
+      ghr pr checks "$n" --watch --fail-fast >/dev/null 2>&1; rc=$?
+      [ $rc -eq 0 ] || die "checks failed on #$n -- not merging (gh pr checks $n); send the failure to the lane and land again"
+    else
+      warn "#$n has no CI checks; merging on the manager's local verification and the review"
+    fi
+  fi
+  ghr pr merge "$n" --squash >/dev/null 2>&1 || die "gh pr merge #$n failed -- branch protection or a conflict; see: gh pr view $n"
+  if [ "$(git -C "$REPO" rev-parse --abbrev-ref HEAD)" = main ] && [ "$(content_dirty "$REPO")" = 0 ]; then
+    git -C "$REPO" pull -q --ff-only origin main 2>/dev/null || warn "could not fast-forward the main checkout; run git pull"
+  fi
+  echo "merged #$n ($b) into main"
+}
+
+# pr <agent> [--no-review] [--no-merge] -- push the lane and open a pull request
+# whose body carries the lane's summary plus the manager's own verification, so
+# CI is a second gate. With AUTO_MERGE=1 (default) it then waits for CI and
+# merges. Nothing touches the main checkout directly.
 cmd_pr() {
   local a="$1"; shift
-  local noreview=""; [ "${1:-}" = "--no-review" ] && noreview=1
+  local noreview="" nomerge=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --no-review) noreview=1; shift ;;
+      --no-merge)  nomerge=1; shift ;;
+      *) die "unknown pr option: $1" ;;
+    esac
+  done
   local d b issue title body checkout verdict url
   d="$(wt_of "$a")"; [ -n "$d" ] && [ -d "$d" ] || die "no worktree for agent '$a'"
   b="$(git -C "$d" rev-parse --abbrev-ref HEAD)"
@@ -798,24 +842,30 @@ cmd_pr() {
     || die "gh pr create failed for '$b' (a PR may already exist: gh pr view $b)"
   echo "opened $url"
   [ -n "$issue" ] && cmd_document "$a" >/dev/null 2>&1 && echo "documented #$issue"
+  if [ "$AUTO_MERGE" = 1 ] && [ -z "$nomerge" ]; then
+    cmd_merge "$a"
+    return $?
+  fi
   return 0
 }
 
-# land <agent> [--pr] [--no-review] -- check, review, require a summary, then
-# either stage a squash onto main (default) or open a PR (LAND_MODE=pr / --pr).
+# land <agent> [--pr] [--no-review] [--no-merge] -- check, review, require a
+# summary, then either stage a squash onto main (default) or open a PR and merge
+# it when CI is green (LAND_MODE=pr / --pr).
 cmd_land() {
   local a="$1"; shift
-  local mode="$LAND_MODE" noreview=""
+  local mode="$LAND_MODE" noreview="" nomerge=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --pr) mode=pr; shift ;;
       --squash) mode=squash; shift ;;
       --no-review) noreview=1; shift ;;
+      --no-merge) nomerge=1; shift ;;
       *) die "unknown land option: $1" ;;
     esac
   done
   if [ "$mode" = pr ]; then
-    cmd_pr "$a" ${noreview:+--no-review}
+    cmd_pr "$a" ${noreview:+--no-review} ${nomerge:+--no-merge}
     return $?
   fi
   local d b
@@ -981,6 +1031,7 @@ case "${1:-status}" in
   review) shift; [ $# -ge 1 ] || die "review needs an agent"; cmd_review "$@" ;;
   document) shift; [ $# -ge 1 ] || die "document needs an agent"; cmd_document "$1" ;;
   pr)     shift; [ $# -ge 1 ] || die "pr needs an agent"; cmd_pr "$@" ;;
+  merge)  shift; [ $# -ge 1 ] || die "merge needs an agent"; cmd_merge "$@" ;;
   land)   shift; [ $# -ge 1 ] || die "land needs an agent"; cmd_land "$@" ;;
   -h|--help|help) usage ;;
   *)      die "unknown command '$1'"; ;;
