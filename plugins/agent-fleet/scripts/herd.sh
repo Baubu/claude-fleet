@@ -166,6 +166,14 @@ cmd_plan() {
   { echo "$PLAN_MARK"; echo; cat "$file"; } > "$tmp"
   ghr issue comment "$issue" --body-file "$tmp" >/dev/null || { rm -f "$tmp"; die "failed to comment on issue #$issue"; }
   cp "$tmp" "$ARCHIVE/plans/issue-${issue}.md"; rm -f "$tmp"
+  # The forge is read-after-write eventually consistent: a launch issued right
+  # after this returned once saw no plan. Wait until the comment reads back.
+  local i
+  for i in $(seq 1 10); do
+    [ -n "$(plan_of "$issue")" ] && break
+    sleep 2
+  done
+  [ -n "$(plan_of "$issue")" ] || warn "plan posted to #$issue but not yet readable through the API; retry launch in a few seconds"
   echo "planned #$issue ($nfiles files) -> issue comment + $ARCHIVE/plans/issue-${issue}.md"
 }
 
@@ -256,10 +264,17 @@ for a in sorted(rows, key=lambda r: r["pane_id"]):
 # lanes all emit, otherwise a crashed or quietly-given-up lane is
 # indistinguishable from a working one.
 cmd_watch() {
-  HERD_STALE_MIN="$STALE_MIN" python -u -c '
+  HERD_STALE_MIN="$STALE_MIN" HERD_WT="$WT" python -u -c '
 import json, subprocess, time, os
 
 STALE = float(os.environ.get("HERD_STALE_MIN") or 30) * 60
+# Herdr lists every agent in the session, across repositories. Only lanes whose
+# cwd is under THIS repo'"'"'s worktree directory are ours to report.
+WT = os.path.normcase(os.path.abspath(os.environ.get("HERD_WT") or ".")).replace("\\", "/").rstrip("/") + "/"
+
+def ours(a):
+    cwd = (a.get("cwd") or "")
+    return os.path.normcase(os.path.abspath(cwd)).replace("\\", "/").startswith(WT)
 
 def sh(args, cwd=None):
     try:
@@ -273,7 +288,7 @@ def poll():
     if out is None:
         return None  # transient: never kill the watch over one bad poll
     try:
-        return {a["name"]: a for a in json.loads(out)["result"]["agents"] if a.get("name")}
+        return {a["name"]: a for a in json.loads(out)["result"]["agents"] if a.get("name") and ours(a)}
     except Exception:
         return None
 
@@ -558,7 +573,11 @@ cmd_launch() {
   # implements on the cheap one. Without a plan the lane guesses the approach,
   # the files and the interfaces -- which is exactly how lanes solve the wrong
   # problem and collide.
-  local plan; plan="$(plan_of "$issue")"
+  local plan i; plan="$(plan_of "$issue")"
+  if [ -z "$plan" ] && [ "$REQUIRE_PLAN" = 1 ] && [ -z "$noplan" ]; then
+    # A plan posted seconds ago may not read back yet; give the forge a moment.
+    for i in 1 2 3 4 5; do sleep 3; plan="$(plan_of "$issue")"; [ -n "$plan" ] && break; done
+  fi
   if [ -z "$plan" ]; then
     if [ "$REQUIRE_PLAN" = 1 ] && [ -z "$noplan" ]; then
       die "no fleet plan on #$issue -- write one (see the skill: 'Plan before launch') and post it with: ./.claude/herd.sh plan $issue <file>   (or pass --no-plan)"
@@ -624,12 +643,21 @@ start_lane_agent() {
     herdr agent start "$name" --kind claude --pane "$pane" --timeout 120000 >/dev/null 2>&1 || rc=$?
   fi
   [ $rc -eq 0 ] && return 0
-  if herdr agent read "$name" --source detection --lines 40 2>/dev/null | grep -qi "trust this folder"; then
-    echo "answering the folder-trust prompt for $name (worktree of this repository)" >&2
-    herdr agent send-keys "$name" down >/dev/null 2>&1
-    herdr agent send-keys "$name" enter >/dev/null 2>&1
-    herdr agent wait "$name" --timeout 120000 >/dev/null 2>&1 || true
-  fi
+  # `agent start` can return before the dialog has rendered, so poll for it
+  # rather than reading the screen once.
+  local i
+  for i in $(seq 1 15); do
+    if herdr agent read "$name" --source detection --lines 40 2>/dev/null | grep -qi "trust this folder"; then
+      echo "answering the folder-trust prompt for $name (worktree of this repository)" >&2
+      herdr agent send-keys "$name" down >/dev/null 2>&1
+      herdr agent send-keys "$name" enter >/dev/null 2>&1
+      herdr agent wait "$name" --timeout 120000 >/dev/null 2>&1 || true
+      break
+    fi
+    st="$(agent_state "$name")"
+    case "$st" in idle|done) return 0 ;; esac
+    sleep 2
+  done
   st="$(agent_state "$name")"
   case "$st" in idle|done) return 0 ;; esac
   warn "$name is '$st' after start; screen follows"
