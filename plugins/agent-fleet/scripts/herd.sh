@@ -1024,17 +1024,25 @@ cmd_recycle() {
 
   echo "archived transcript -> $(archive_lane "$a" "$d" "$b")"
 
-  herdr worktree remove --workspace "$ws" --force >/dev/null 2>&1
+  # Teardown, in an order that survives partial failure. `herdr worktree
+  # remove` unregisters the checkout but has been seen to fail with "not a
+  # working tree" and leave the workspace -- and its shell, whose cwd is the
+  # lane directory -- alive. That shell is the memory the owner wanted back and
+  # the lock that stops the directory from being deleted. So: close the
+  # workspace explicitly, prune, then delete the directory ourselves.
+  herdr worktree remove --workspace "$ws" --force >/dev/null 2>&1 || true
+  herdr workspace close "$ws" >/dev/null 2>&1 || true
   git -C "$REPO" worktree prune
-  # Herdr drops the workspace and git forgets the worktree, but the directory
-  # itself survives when it holds untracked content (a .venv, node_modules,
-  # Packages/): half a gigabyte per lane on disk for nothing. Remove it once
-  # git no longer lists it.
-  if [ -d "$d" ] && ! git -C "$REPO" worktree list --porcelain | grep -qiF "$(cd "$d" && pwd -W 2>/dev/null || pwd)"; then
-    rm -rf "$d" 2>/dev/null || warn "could not delete $d; remove it by hand"
+  if [ -d "$d" ]; then
+    local i
+    for i in 1 2 3 4 5; do
+      rm -rf "$d" 2>/dev/null && break
+      sleep 2   # the closed shell can take a moment to release the directory
+    done
+    [ -d "$d" ] && warn "could not delete $d (still locked); remove it by hand"
   fi
   git -C "$REPO" branch -D "$b" >/dev/null 2>&1
-  echo "recycled $a (workspace $ws, branch $b -- origin copy retained, worktree dir removed)"
+  echo "recycled $a (workspace $ws closed, branch $b -- origin copy retained, worktree dir removed)"
 }
 
 # report [since] -- what the fleet actually did, for a human catching up.
