@@ -61,6 +61,15 @@ you will report phantom uncommitted work.
 7. **Scope.** Files changed that the issue does not explain are a finding. Lane
    agents drift into unrelated refactors and that is what makes merges conflict.
 
+## How to run checks
+
+You run headless, in a single turn: nothing continues after you stop, so never start a
+test or check as a background task and never "pause" to wait for one. Run every command
+in the foreground and wait for it. If the full suite is too slow for one run, run the
+test files the diff touches plus the linters, say exactly which you ran, and judge the
+rest from the lane summary. Always finish with the verdict line below; a review with no
+verdict is discarded and re-run, which costs more than a slow suite.
+
 ## Verdict
 
 End with exactly one line containing only the word:
