@@ -150,6 +150,25 @@ plan_files() {
   plan_of "$1" | plan_section "Files" | sed -n 's/^[[:space:]]*[-*]\{0,1\}[[:space:]]*\(create\|modify\|delete\):[[:space:]]*`\{0,1\}\([^` ]*\)`\{0,1\}.*$/\2/p'
 }
 
+# plan_gap <worktree> <issue> -- files in the lane's diff that the plan's Files
+# list does not name and .claude/lane-summary.md does not mention. Printed one
+# per line; empty when there is nothing to explain. This is the check the
+# reviewer used to make by hand and send back as a FIX, costing a whole land
+# cycle for a one-line summary edit.
+plan_gap() {
+  local d="$1" issue="$2" f planned summary
+  planned="$(plan_files "$issue")"
+  [ -n "$planned" ] || return 0
+  summary="$d/.claude/lane-summary.md"
+  git -C "$d" diff --name-only "origin/main...HEAD" 2>/dev/null | while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    case "$f" in .claude/*) continue ;; esac
+    printf '%s\n' "$planned" | grep -qxF "$f" && continue
+    [ -s "$summary" ] && grep -qF "$f" "$summary" && continue
+    printf '%s\n' "$f"
+  done
+}
+
 # plan_lane <issue> <key> -- "model" or "effort" from the plan's Lane section.
 plan_lane() {
   plan_of "$1" | plan_section "Lane" | sed -n "s/.*$2:[[:space:]]*\([A-Za-z0-9._-]*\).*/\1/p" | head -1
@@ -781,7 +800,7 @@ build_brief() {
   if [ -n "$checkcmd" ]; then
     brief="$brief Before you write your summary, run the project's checks yourself: $checkcmd -- and record the exact result under '## Verified'. Do not report done with failing checks; fix them first."
   fi
-  brief="$brief Commit to this branch with a conventional commit message ending in 'Closes #$issue'. When done, write your closing summary to .claude/lane-summary.md in this worktree, with the headings '## What was done', '## Deviations from plan', '## Still needs a human' and '## Verified' -- that file is posted verbatim as a comment on issue #$issue, so write it for the repository owner rather than for me. Say what you could NOT verify rather than omitting it; write 'none' under 'Deviations from plan' and 'nothing' under 'Still needs a human' if that is genuinely true. Then reply with the same summary in the pane."
+  brief="$brief Before writing the summary, run 'git diff --name-only origin/main...HEAD' and list under '## Deviations from plan' every file that is not in the plan's Files list, one line each with why it was needed; landing is refused until every such file is explained. Commit to this branch with a conventional commit message ending in 'Closes #$issue'. When done, write your closing summary to .claude/lane-summary.md in this worktree, with the headings '## What was done', '## Deviations from plan', '## Still needs a human' and '## Verified' -- that file is posted verbatim as a comment on issue #$issue, so write it for the repository owner rather than for me. Say what you could NOT verify rather than omitting it; write 'none' under 'Deviations from plan' and 'nothing' under 'Still needs a human' if that is genuinely true. Then reply with the same summary in the pane."
   printf '%s' "$brief"
 }
 
@@ -864,7 +883,7 @@ cmd_review() {
   sys="$(reviewer_prompt)"
   plan="$(plan_of "${issue:-0}")"
   surface="$(cmd_collisions "${issue:-}" 2>/dev/null || true)"
-  task="Review the lane at $d (branch $b) against base origin/main${issue:+ for issue #$issue}. Work from inside that directory. Run the git commands from your instructions, read the issue with 'gh issue view $issue', read CLAUDE.md, and run the project's checks if they are cheap."
+  task="Review the lane at $d (branch $b) against base origin/main${issue:+ for issue #$issue}. Work from inside that directory. Run the git commands from your instructions, read the issue with 'gh issue view $issue', read CLAUDE.md. Do NOT run the full test suite: the manager's check already ran it on this exact commit and CI runs it again on the pull request. Run the linters and only the test files the diff touches (git diff --name-only origin/main...HEAD, plus the tests of the modules it changes), in the foreground, never as a background task, and say exactly which you ran."
   [ -n "$plan" ] && task="$task The manager's plan for this issue follows between the markers. Only files that appear in the diff against the base count as touched by the lane; a file that exists on the base branch untouched is not a deviation. Files in the diff, or interfaces, that differ from the plan without a '## Deviations from plan' explanation in .claude/lane-summary.md are a FIX. <<<PLAN
 $plan
 PLAN>>>"
@@ -914,6 +933,17 @@ gate_for_landing() {
   [ "$(content_dirty "$d")" = 0 ] || die "'$a' has uncommitted changes; commit or stash first"
   rebase_onto_main "$a" "$d" "$b"
   cmd_check "$a" || die "checks failed for '$a' -- not landing"
+  # The summary is captured BEFORE the review so the deviations gate below can
+  # read it, and so the reviewer judges the summary the owner will actually see.
+  capture_summary "$a" "$d" || die "'$a' wrote no closing summary -- not landing an undocumented merge"
+  local gap issue_n
+  issue_n="$(issue_of_branch "$b")"
+  gap="$(plan_gap "$d" "${issue_n:-0}")"
+  if [ -n "$gap" ]; then
+    herdr agent prompt "$a" "Before the review can run: these files are in your diff but are not in the plan's Files list and are not mentioned under '## Deviations from plan' in .claude/lane-summary.md: $(printf '%s' "$gap" | tr '\n' ' '). Add one line per file there saying why it was needed, or revert the file if it was not. Do not change anything else. Report done when the summary is updated." >/dev/null 2>&1 \
+      || echo "warning: could not prompt '$a'" >&2
+    die "plan gap for '$a' -- $(printf '%s' "$gap" | tr '\n' ' ') not in the plan or the summary; sent to the lane, land again when it reports done"
+  fi
   if [ -z "$noreview" ]; then
     cmd_review "$a"; rc=$?
     case $rc in
@@ -923,9 +953,9 @@ gate_for_landing() {
       *) die "review returned ESCALATE (or no verdict) for '$a' -- read $ARCHIVE/review-${a}-*.md and decide" ;;
     esac
   fi
-  # Documentation is a landing requirement, not a later cleanup. Captured BEFORE
-  # the merge because the agent that knows the answers is still alive.
-  capture_summary "$a" "$d" || die "'$a' wrote no closing summary -- not landing an undocumented merge"
+  # Documentation is a landing requirement, not a later cleanup; it was captured
+  # above, before the review, while the agent that knows the answers is alive.
+  [ -s "$d/.claude/lane-summary.md" ] || die "'$a' wrote no closing summary -- not landing an undocumented merge"
 }
 
 # merge <agent> [--no-wait] -- wait for the lane's PR checks, squash-merge it,

@@ -226,10 +226,23 @@ everything that is not.
   gates are the checks you re-ran, the independent review, the closing summary and
   CI. Once those are green, merge — `land` in PR mode does this itself
   (`AUTO_MERGE=1`), and `merge <agent>` does it for a PR opened earlier. Land lanes
-  one at a time, re-running checks after each, so a conflict has one obvious
-  author. Keep a human gate only on the genuinely irreversible: applying migrations,
+  of the same repository one at a time, re-running checks after each, so a
+  conflict has one obvious author; lanes of different repositories land in
+  parallel, one land pane per repository, because they share no files and the
+  land is mostly waiting (checks, review, CI). Keep a human gate only on the genuinely irreversible: applying migrations,
   reseeding live data, spending money, anything that changes what users see. Say
   what the change will look like to a user before doing it.
+- **Refill on `done`, not on recycle.** When a lane reports done with a commit and
+  a summary, launch the next planned issue into a slot immediately (memory
+  permitting) and land the finished lane in parallel; waiting for the merge to
+  recycle first leaves the slot idle for the whole land.
+- **Unplanned files are the lane's to explain, before the review.** `land` refuses
+  to review while the diff contains a file the plan does not list and the summary
+  does not mention (`plan_gap`); the lane gets the list and fixes the summary.
+  This is deterministic, so the paid review never spends a cycle on paperwork.
+- **The review does not re-run the suite.** `check` ran it on the same commit and
+  CI runs it on the pull request; the reviewer runs linters and the touched tests
+  only, in the foreground, and always ends with a verdict.
 - **Prefer waiting to polling.** `herdr agent wait <name> --until blocked` and
   `--wait` on prompts are event-driven. A status loop on a short timer burns tokens
   across every lane at once for no new information.

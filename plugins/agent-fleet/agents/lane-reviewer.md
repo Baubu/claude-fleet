@@ -65,9 +65,10 @@ you will report phantom uncommitted work.
 
 You run headless, in a single turn: nothing continues after you stop, so never start a
 test or check as a background task and never "pause" to wait for one. Run every command
-in the foreground and wait for it. If the full suite is too slow for one run, run the
-test files the diff touches plus the linters, say exactly which you ran, and judge the
-rest from the lane summary. Always finish with the verdict line below; a review with no
+in the foreground and wait for it. Do not run the full test suite: the manager's check
+ran it on this commit and CI runs it again on the pull request. Run the linters and the
+test files the diff touches (plus the tests of the modules it changes), say exactly
+which you ran, and judge the rest from the lane summary and the CI result. Always finish with the verdict line below; a review with no
 verdict is discarded and re-run, which costs more than a slow suite.
 
 ## Verdict
