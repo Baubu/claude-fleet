@@ -164,6 +164,10 @@ plan_gap() {
     [ -n "$f" ] || continue
     case "$f" in .claude/*) continue ;; esac
     printf '%s\n' "$planned" | grep -qxF "$f" && continue
+    # A planned directory (trailing slash) covers every file under it.
+    printf '%s\n' "$planned" | grep -E '/$' | while IFS= read -r dir; do
+      case "$f" in "$dir"*) echo covered ;; esac
+    done | grep -q covered && continue
     [ -s "$summary" ] && grep -qF "$f" "$summary" && continue
     printf '%s\n' "$f"
   done
