@@ -84,7 +84,7 @@ then requires the lane's closing summary, then stages a squash — or, with
 summary, the manager's re-run check output and the review verdict, waits for CI,
 and merges it.
 
-`.claude/fleet.conf` keys: `CHECK_CMD`, `INSTALL_CMD`, `CODEGEN_CMD`,
+`.claude/fleet.conf` keys: `CHECK_CMD`, `INSTALL_CMD`, `CODEGEN_CMD`, `GC_NOTICE_MB`,
 `REQUIRE_PLAN`, `LAND_MODE`, `AUTO_MERGE`, `REVIEW_MODEL`, `STALE_MIN`,
 `LANE_MODEL`, `LANE_EFFORT`. All optional; see the skill for each.
 
@@ -174,4 +174,6 @@ Disk is the cost people forget, because nothing reports it. Each lane is a full
 checkout with its own dependency tree and build cache — on a Next.js repo, about
 1.4 GB. One repository was found holding thirty retired lane directories, 22 GB,
 every one of them created by a teardown that printed success. `herd.sh status`
-now counts the ones git has lost track of, and `herd.sh gc` reclaims them.
+measures the ones git has lost track of and says so once they add up to half a
+gigabyte (`GC_NOTICE_MB` in `fleet.conf` changes the threshold); `herd.sh gc`
+reclaims them.

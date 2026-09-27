@@ -358,15 +358,22 @@ for a in sorted(rows, key=lambda r: r["pane_id"]):
 
   # Directories under $WT that git does not register are invisible to every
   # other command here, which is how a repo quietly accumulates twenty-two
-  # gigabytes of retired lanes. Count them where the manager already looks.
-  local stray=0 dd
+  # gigabytes of retired lanes. Measure them where the manager already looks --
+  # but only speak up past GC_NOTICE_MB (default 512). A handful of 1 MB shells
+  # left by a delete that fell short is not worth a line on every status; a
+  # dependency tree that survived teardown is.
+  local stray=0 total=0 dd size
   for dd in "$WT"/*; do
     [ -d "$dd" ] || continue
     [ -e "$dd/.git" ] && git -C "$dd" rev-parse --git-dir >/dev/null 2>&1 && continue
     stray=$((stray + 1))
+    size="$(du -sm "$dd" 2>/dev/null | cut -f1)"
+    total=$((total + ${size:-0}))
   done
-  [ "$stray" -gt 0 ] && printf '\n%s orphaned director%s under .claude/worktrees -- ./.claude/herd.sh gc\n' \
-    "$stray" "$([ "$stray" = 1 ] && echo y || echo ies)"
+  if [ "$stray" -gt 0 ] && [ "$total" -ge "${GC_NOTICE_MB:-512}" ]; then
+    printf '\n%s orphaned director%s under .claude/worktrees, %s MB -- ./.claude/herd.sh gc\n' \
+      "$stray" "$([ "$stray" = 1 ] && echo y || echo ies)" "$total"
+  fi
   return 0
 }
 
