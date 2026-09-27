@@ -475,6 +475,26 @@ does this itself (`AUTO_RECYCLE=1`), and `recycle <agent>` does it for anything
 merged by hand. Do not keep finished panes around in case a follow-up question
 comes up.
 
+**Then check that it actually left, with `gc`.** Memory is not the expensive
+part: the worktree carries its own dependency tree and build cache, around
+1.4 GB on a Next.js repo, and teardown has a failure mode that reports success.
+`git worktree remove` unregisters the checkout before it deletes it, so when the
+delete fails the directory survives while disappearing from `git worktree list` —
+invisible to `status` and to every other command that enumerates lanes from git.
+On Windows the delete fails as a matter of course, because MSYS `rm -rf` cannot
+open a `node_modules` path past `MAX_PATH`; renaming the repo directory orphans
+every worktree at once for the same reason, since each `.git` file stores an
+absolute path. One repository had accumulated thirty such directories and 22 GB.
+
+`gc` is the sweep: a dry run by default, safe to repeat, and it refuses to touch
+a worktree with uncommitted or untracked work. Committed work is never at risk in
+either case, because removing a worktree does not delete its branch. It also
+holds back any lane carrying gitignored files that are not build output —
+`node_modules` and `.next` go without asking, a `scraper-output/` directory does
+not. That rule exists because a retired lane was found holding raw scraper output
+three times the size of the copy in the main checkout, which nothing else would
+have protected: it was gitignored, so git could not.
+
 **Recycling never deletes the conversation.** The transcript lives under
 `~/.claude/projects/` keyed by the worktree path and outlives both the pane and
 the directory; the closing summary is already on the issue and in the archive; and
@@ -589,7 +609,7 @@ bug fix reached only one side — which is the whole reason the script is packag
 rather than pasted.
 
 `herd.sh` provides: `status`, `plan`, `deps`, `collisions`, `launch`, `brief`,
-`watch`, `report`, `archive`, `recycle`, `resume`, `read`, `say`, `check`,
+`watch`, `report`, `archive`, `recycle`, `gc`, `resume`, `read`, `say`, `check`,
 `review`, `document`, `pr`, `merge`, `land`. Run it with `help` for usage.
 
 A brand-new worktree is a directory Claude Code has never seen, so the lane's

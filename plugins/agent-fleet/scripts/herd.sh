@@ -20,6 +20,7 @@
 #   ./.claude/herd.sh report [since]    # what the fleet did, for a human catching up
 #   ./.claude/herd.sh archive <agent>   # snapshot a lane's transcript, no teardown
 #   ./.claude/herd.sh recycle <agent>   # archive, then retire a fully-pushed lane (chat is kept)
+#   ./.claude/herd.sh gc [--yes] [--size]  # reclaim orphaned and finished lane directories
 #   ./.claude/herd.sh resume <agent>    # reopen a recycled lane's chat in a new pane, context intact
 #   ./.claude/herd.sh read <agent> [n]  # last n lines of an agent's transcript
 #   ./.claude/herd.sh say <agent> <txt> # prompt an agent
@@ -99,6 +100,63 @@ content_dirty() {
   n=$((n + $(git -C "$1" diff --cached --numstat 2>/dev/null | grep -c . || true)))
   echo "$n"
 }
+
+# Normalise a path for comparison. `git worktree list` prints Windows paths
+# (C:/Users/...) while a glob under $WT yields MSYS paths (/c/Users/...), so the
+# two are never equal as strings even when they name the same directory -- which
+# would make every registered worktree look orphaned.
+norm_path() {
+  if command -v cygpath >/dev/null 2>&1; then
+    cygpath -u "$1" 2>/dev/null || printf '%s' "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+# Delete a directory and everything under it. Returns non-zero if any of it
+# survives, so no caller can report a removal that did not happen.
+#
+# `rm -rf` alone is not enough on Windows, and its failure is quiet in a way
+# that accumulates: MSYS rm cannot open a path longer than MAX_PATH, and a
+# node_modules tree crosses that inside @babel and @crawlee within a few levels.
+# Every recycle that hit it left a ~1.4 GB directory behind while still printing
+# that the lane had been retired. One repo was found holding thirty such
+# directories and twenty-two gigabytes.
+#
+# cmd's rmdir under the \\?\ prefix is the one path form Windows lets past
+# MAX_PATH, so that is the fallback. MSYS2_ARG_CONV_EXCL stops MSYS rewriting
+# the prefix into something cmd cannot parse.
+#
+# A file can also be left delete-pending -- reported as both "access is denied"
+# and "does not exist" -- while a scanner still holds a handle. That clears on
+# its own, which is why `gc` is idempotent: a later run finishes the job.
+purge_dir() {
+  local d="$1" i win
+  [ -n "$d" ] || return 0
+  [ -e "$d" ] || return 0
+  for i in 1 2 3; do
+    rm -rf "$d" 2>/dev/null
+    [ -e "$d" ] || return 0
+    if command -v cygpath >/dev/null 2>&1 && command -v cmd >/dev/null 2>&1; then
+      win="$(cygpath -w "$d" 2>/dev/null)"
+      if [ -n "$win" ]; then
+        MSYS2_ARG_CONV_EXCL='*' cmd //c "rmdir /s /q \"\\\\?\\$win\"" >/dev/null 2>&1
+        [ -e "$d" ] || return 0
+      fi
+    fi
+    sleep 2   # a just-closed pane can hold its cwd for a moment
+  done
+  [ -e "$d" ] && return 1
+  return 0
+}
+
+# Gitignored paths that are pure build or dependency output, and can go without
+# asking. Anything else a lane left behind while ignored -- a scraper dump, a
+# downloaded fixture, an edited .env -- is data the owner may want, so `gc`
+# reports it and keeps the directory rather than deleting it silently. Not
+# hypothetical: a recycled lane was found holding a scraper output file three
+# times the size of the one in the main checkout.
+DISPOSABLE='node_modules|\.next|\.nuxt|\.turbo|\.svelte-kit|dist|build|out|coverage|target|Packages|\.venv|venv|__pycache__|\.pytest_cache|\.gradle|\.cache|.*\.tsbuildinfo|\.env|\.env\..*|\.DS_Store|Thumbs\.db'
 
 issue_of_branch() { printf '%s' "$1" | sed -n 's/^issue-\([0-9][0-9]*\)-.*/\1/p'; }
 
@@ -296,6 +354,19 @@ for a in sorted(rows, key=lambda r: r["pane_id"]):
     dirty="$(content_dirty "$d")"
     printf '%-30s %-26s +%s commits, %s dirty\n' "$n" "$b" "$ahead" "$dirty"
   done
+
+  # Directories under $WT that git does not register are invisible to every
+  # other command here, which is how a repo quietly accumulates twenty-two
+  # gigabytes of retired lanes. Count them where the manager already looks.
+  local stray=0 dd
+  for dd in "$WT"/*; do
+    [ -d "$dd" ] || continue
+    [ -e "$dd/.git" ] && git -C "$dd" rev-parse --git-dir >/dev/null 2>&1 && continue
+    stray=$((stray + 1))
+  done
+  [ "$stray" -gt 0 ] && printf '\n%s orphaned director%s under .claude/worktrees -- ./.claude/herd.sh gc\n' \
+    "$stray" "$([ "$stray" = 1 ] && echo y || echo ies)"
+  return 0
 }
 
 # Event stream for Monitor: one line per lane transition into a settled state.
@@ -1160,16 +1231,201 @@ cmd_recycle() {
   herdr worktree remove --workspace "$ws" --force >/dev/null 2>&1 || true
   herdr workspace close "$ws" >/dev/null 2>&1 || true
   git -C "$REPO" worktree prune
-  if [ -d "$d" ]; then
-    local i
-    for i in 1 2 3 4 5; do
-      rm -rf "$d" 2>/dev/null && break
-      sleep 2   # the closed shell can take a moment to release the directory
-    done
-    [ -d "$d" ] && warn "could not delete $d (still locked); remove it by hand"
+  # Say what actually happened. The old wording claimed the directory was gone
+  # whatever the delete returned, so a fleet could report twenty clean recycles
+  # while twenty full checkouts sat on disk. purge_dir returns non-zero when any
+  # of it survives, and that is what gets printed.
+  local disk="worktree dir removed"
+  if ! purge_dir "$d"; then
+    disk="WORKTREE DIR STILL ON DISK"
+    warn "could not delete $d -- run './.claude/herd.sh gc --yes' to finish it"
   fi
   git -C "$REPO" branch -D "$b" >/dev/null 2>&1
-  echo "recycled $a (workspace $ws closed, branch $b -- origin copy retained, worktree dir removed)"
+  echo "recycled $a (workspace $ws closed, branch $b -- origin copy retained, $disk)"
+}
+
+# gc [--yes] [--size] [--keep <agent>]... -- reclaim the disk a fleet leaves behind.
+#
+# Two kinds of garbage accumulate under .claude/worktrees, and neither announces
+# itself:
+#
+#   orphan     a directory git no longer registers. Left by a recycle whose
+#              delete failed (see purge_dir), by `git worktree remove` giving up
+#              half way -- it unregisters first and deletes second, so a failed
+#              delete produces exactly this -- or by renaming the repo
+#              directory, which points every worktree's gitdir at a path that no
+#              longer exists.
+#   finished   a lane that landed weeks ago and still holds a full checkout, its
+#              own dependency tree and its own build cache. Keeping one alive is
+#              deliberate: while the pane lives you can still ask its agent a
+#              follow-up. Keeping twenty is just disk.
+#
+# Dry run by default -- it prints what it would reclaim and stops. --yes acts.
+#
+# Nothing with uncommitted content, untracked files, or commits that exist
+# nowhere else is ever touched, with or without --yes. Removing a worktree does
+# not delete its branch, so committed work survives regardless; the things that
+# do not survive are the ones gc refuses to touch.
+cmd_gc() {
+  local act=0 want_size=0
+  local -a keep=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes|-y)  act=1 ;;
+      --size)    want_size=1 ;;
+      --keep)    shift; [ -n "${1:-}" ] || die "gc: --keep needs an agent or directory name"; keep+=("$1") ;;
+      *)         die "gc: unknown flag '$1'" ;;
+    esac
+    shift
+  done
+
+  [ -d "$WT" ] || { echo "no $WT -- nothing to collect"; return 0; }
+
+  # Registered worktrees, normalised so the MSYS/Windows spelling cannot make a
+  # live lane look like garbage.
+  local reg_list="" p
+  while IFS= read -r p; do
+    [ -n "$p" ] && reg_list="$reg_list$(norm_path "$p")
+"
+  done <<EOF
+$(git -C "$REPO" worktree list --porcelain | sed -n 's|^worktree ||p')
+EOF
+
+  # Directories a live agent is sitting in. A lane still being worked is never
+  # garbage, whatever its git state says.
+  local busy_list="" a
+  while IFS= read -r a; do
+    [ -n "$a" ] || continue
+    p="$(wt_of "$a")"
+    [ -n "$p" ] && busy_list="$busy_list$(norm_path "$p")
+"
+  done <<EOF
+$(herdr agent list 2>/dev/null | python -c '
+import sys, json
+try: rows = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace"))["result"]["agents"]
+except Exception: rows = []
+for r in rows:
+    n = r.get("name")
+    if n: print(n)')
+EOF
+
+  printf '%-28s %-10s %s\n' "DIRECTORY" "VERDICT" "WHY"
+  local d name nd verdict why b dirty untracked held size hint
+  local -a doomed=()
+  local n_keep=0
+
+  for d in "$WT"/*; do
+    [ -d "$d" ] || continue
+    name="$(basename "$d")"
+    nd="$(norm_path "$d")"
+    verdict=""; why=""; b=""
+
+    case " ${keep[*]:-} " in *" $name "*) verdict=keep; why="--keep" ;; esac
+
+    if [ -z "$verdict" ] && printf '%s' "$busy_list" | grep -qxF "$nd"; then
+      verdict=live; why="an agent is working here"
+    fi
+
+    if [ -z "$verdict" ]; then
+      if printf '%s' "$reg_list" | grep -qxF "$nd"; then
+        b="$(git -C "$d" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+        if [ "$b" = main ] || [ "$b" = master ]; then
+          verdict=keep; why="on $b -- not a lane"
+        else
+          dirty="$(content_dirty "$d")"
+          untracked="$(git -C "$d" ls-files --others --exclude-standard 2>/dev/null | grep -c . || true)"
+          if [ "$dirty" != 0 ] || [ "$untracked" != 0 ]; then
+            verdict=dirty; why="$dirty modified, $untracked untracked -- would lose work"
+          else
+            held="$(gc_held_data "$d")"
+            if [ -n "$held" ]; then
+              verdict=holds; why="ignored data: $(printf '%s' "$held" | tr '\n' ' ')"
+            else
+              verdict=finished; why="branch $b -- committed work stays on the branch"
+            fi
+          fi
+        fi
+      else
+        held="$(gc_held_orphan "$d")"
+        if [ -n "$held" ]; then
+          verdict=holds; why="orphan, but holds: $(printf '%s' "$held" | tr '\n' ' ')"
+        else
+          verdict=orphan; why="git does not register this directory"
+        fi
+      fi
+    fi
+
+    size=""
+    if [ "$want_size" = 1 ]; then
+      size="$(du -sm "$d" 2>/dev/null | cut -f1)"
+      [ -n "$size" ] && why="${size} MB, $why"
+    fi
+
+    printf '%-28s %-10s %s\n' "$name" "$verdict" "$why"
+    case "$verdict" in
+      finished|orphan) doomed+=("$d") ;;
+      *) n_keep=$((n_keep + 1)) ;;
+    esac
+  done
+
+  echo
+  if [ "${#doomed[@]}" -eq 0 ]; then
+    echo "nothing to collect ($n_keep kept)"
+    git -C "$REPO" worktree prune
+    return 0
+  fi
+
+  if [ "$act" != 1 ]; then
+    echo "${#doomed[@]} director$([ "${#doomed[@]}" = 1 ] && echo y || echo ies) would be reclaimed, $n_keep kept"
+    hint="re-run with --yes to act"
+    [ "$want_size" = 1 ] || hint="$hint (add --size for megabytes -- slow on Windows)"
+    echo "$hint"
+    return 0
+  fi
+
+  local failed=0
+  for d in "${doomed[@]}"; do
+    name="$(basename "$d")"
+    # Unregister first where git knows the path, so a failed delete leaves a
+    # plain orphan a later gc can finish rather than a half-registered worktree.
+    git -C "$REPO" worktree remove --force "$d" >/dev/null 2>&1 || true
+    if purge_dir "$d"; then
+      echo "reclaimed $name"
+    else
+      failed=$((failed + 1))
+      warn "$name survives -- a handle is still open; re-run gc once the holder exits"
+    fi
+  done
+  git -C "$REPO" worktree prune
+  echo
+  echo "reclaimed $(( ${#doomed[@]} - failed )) of ${#doomed[@]}; $n_keep kept"
+  [ "$failed" -gt 0 ] && echo "$failed left for the next run -- gc is safe to repeat"
+  return 0
+}
+
+# Gitignored paths inside a registered worktree that are not build or dependency
+# output -- the things a purge would destroy and nobody could get back.
+gc_held_data() {
+  git -C "$1" status --porcelain --ignored=matching --untracked-files=no 2>/dev/null \
+    | sed -n 's|^!! ||p' \
+    | sed 's|/$||' \
+    | grep -Ev "^($DISPOSABLE)(/|$)" \
+    | head -5 || true
+}
+
+# Same question for an orphan, where there is no git to ask. Anything at the top
+# level that is neither disposable output nor a path the repo tracks at HEAD is
+# something a lane produced and nobody collected.
+gc_held_orphan() {
+  local d="$1" e base
+  for e in "$d"/* "$d"/.*; do
+    base="$(basename "$e")"
+    case "$base" in .|..) continue ;; esac
+    [ -e "$e" ] || continue
+    printf '%s' "$base" | grep -Eq "^($DISPOSABLE)$" && continue
+    git -C "$REPO" cat-file -e "HEAD:$base" 2>/dev/null && continue
+    printf '%s\n' "$base"
+  done | head -5
 }
 
 # report [since] -- what the fleet actually did, for a human catching up.
@@ -1279,6 +1535,7 @@ case "${1:-status}" in
   report) shift; cmd_report "$@" ;;
   archive) shift; [ $# -ge 1 ] || die "archive needs an agent"; cmd_archive "$1" ;;
   recycle) shift; [ $# -ge 1 ] || die "recycle needs an agent"; cmd_recycle "$1" ;;
+  gc)     shift; cmd_gc "$@" ;;
   read)   shift; [ $# -ge 1 ] || die "read needs an agent"; cmd_read "$@" ;;
   say)    shift; [ $# -ge 1 ] || die "say needs an agent"; cmd_say "$@" ;;
   check)  shift; [ $# -ge 1 ] || die "check needs an agent"; cmd_check "$1" ;;

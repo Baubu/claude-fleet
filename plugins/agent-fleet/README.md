@@ -46,6 +46,7 @@ Requires [Herdr](https://herdr.dev) (`HERDR_ENV=1`) and a git repository.
 ./.claude/herd.sh report [since]    # what the fleet did, for a human catching up
 ./.claude/herd.sh archive <agent>   # snapshot a lane's transcript, no teardown
 ./.claude/herd.sh recycle <agent>   # archive, then retire a fully-pushed lane (the chat is kept)
+./.claude/herd.sh gc [--yes]        # reclaim orphaned and finished lane directories
 ./.claude/herd.sh resume <agent>    # reopen a recycled lane's chat in a new pane, context intact
 ./.claude/herd.sh read <agent> [n]  # last n lines of an agent's transcript
 ./.claude/herd.sh say <agent> <txt> # prompt an agent
@@ -143,9 +144,17 @@ Each of these cost real time before it was written down.
   reasoning from documentation describing a design that had already been replaced.
   It had not.
 - **Recycle the moment a feature is merged.** An open pane is a running agent and
-  holds roughly 200 MB whether it is working or finished. `merge` recycles the lane
-  itself. The conversation is never deleted: `resume <agent>` reopens it with its
-  context intact.
+  holds roughly 200 MB of memory whether it is working or finished — and its
+  worktree holds its own dependency tree and build cache, which on a Next.js repo
+  is about 1.4 GB per lane. `merge` recycles the lane itself. The conversation is
+  never deleted: `resume <agent>` reopens it with its context intact.
+- **Run `gc` after a batch lands.** A retired lane does not always leave:
+  `git worktree remove` unregisters before it deletes, so a failed delete leaves a
+  full checkout that no longer appears in `git worktree list` — garbage nothing
+  counts. On Windows that delete fails routinely, because `rm -rf` cannot open a
+  `node_modules` path past `MAX_PATH`. `gc` finds those directories and the lanes
+  that simply went stale, is a dry run by default, and refuses anything holding
+  uncommitted work or un-collected gitignored data.
 - **Keep working; escalate rarely.** Merging green PRs, rebasing, filing issues and
   opening lanes are the manager's job, not requests — never end a landing by asking
   the owner to merge. Escalate only what is irreversible and user-visible, a
@@ -159,3 +168,9 @@ Each of these cost real time before it was written down.
 The fleet multiplies token spend roughly linearly in lane count. That is the trade
 for wall-clock parallelism. If the account bills beyond its plan, an unattended
 refill loop is exactly the shape that runs into it — cap the lanes.
+
+Disk is the cost people forget, because nothing reports it. Each lane is a full
+checkout with its own dependency tree and build cache — on a Next.js repo, about
+1.4 GB. One repository was found holding thirty retired lane directories, 22 GB,
+every one of them created by a teardown that printed success. `herd.sh status`
+now counts the ones git has lost track of, and `herd.sh gc` reclaims them.
