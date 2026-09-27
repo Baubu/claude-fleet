@@ -276,7 +276,17 @@ changes as an event stream and let the harness wake you:
 ./.claude/herd.sh watch   # one line per transition into idle / done / blocked / vanished / stale
 ```
 
-Arm it with the Monitor tool, `persistent: true`. Two rules from Monitor's own
+Arm it with the Monitor tool, `persistent: true`. **Never run `watch` as a
+background shell command and then end your turn.** A finished background task is
+reported only when the next turn starts, and nothing starts one while you are
+waiting — two lanes once sat finished and unlanded until the owner asked why.
+When Monitor is not available, block in the foreground instead:
+
+```bash
+./.claude/herd.sh wait --minutes 9 lane-a lane-b   # returns the first settled lane's line, or 1 on the deadline
+```
+
+and call it again while lanes are still running. Two rules from Monitor's own
 guidance apply directly here:
 
 - **Silence must never mean "fine".** Emit on `blocked` and on an agent
@@ -609,7 +619,7 @@ bug fix reached only one side — which is the whole reason the script is packag
 rather than pasted.
 
 `herd.sh` provides: `status`, `plan`, `deps`, `collisions`, `launch`, `brief`,
-`watch`, `report`, `archive`, `recycle`, `gc`, `resume`, `read`, `say`, `check`,
+`watch`, `wait`, `report`, `archive`, `recycle`, `gc`, `resume`, `read`, `say`, `check`,
 `review`, `document`, `pr`, `merge`, `land`. Run it with `help` for usage.
 
 A brand-new worktree is a directory Claude Code has never seen, so the lane's

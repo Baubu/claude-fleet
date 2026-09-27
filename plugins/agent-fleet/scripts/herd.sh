@@ -17,6 +17,7 @@
 #   ./.claude/herd.sh launch <n> <slug> [name] [--model M] [--effort L] [--force] [--no-plan]
 #   ./.claude/herd.sh brief <agent>     # (re)send the opening brief to an idle lane
 #   ./.claude/herd.sh watch             # event stream of lane state changes (incl. stale)
+#   ./.claude/herd.sh wait [--minutes N] [agent...]  # block in the foreground until a lane settles
 #   ./.claude/herd.sh report [since]    # what the fleet did, for a human catching up
 #   ./.claude/herd.sh archive <agent>   # snapshot a lane's transcript, no teardown
 #   ./.claude/herd.sh recycle <agent>   # archive, then retire a fully-pushed lane (chat is kept)
@@ -1520,12 +1521,50 @@ cmd_say() {
   herdr agent prompt "$a" "$*"
 }
 
+# Foreground counterpart of `watch`: block until one of the named lanes (any lane
+# when none is named) settles -- done, blocked, vanished or stale -- or until the
+# deadline passes, then print that one line and return. Exit 0 on a settled lane,
+# 1 on the deadline.
+#
+# This exists because `watch` run as a *background* command does not wake an idle
+# manager: a finished background task is reported at the start of the next turn,
+# and nothing starts a turn while the manager is waiting. Two lanes once finished
+# and sat unlanded until the owner asked why. A foreground call keeps the turn
+# alive and hands the line straight back. Keep --minutes under the tool's own
+# timeout (nine is safe against a ten-minute limit) and call it again on 1.
+cmd_wait() {
+  local minutes=9 names=() pat
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --minutes) [ -n "${2:-}" ] || die "wait --minutes needs a number"; minutes="$2"; shift 2 ;;
+      -*) die "wait: unknown option '$1'" ;;
+      *) names+=("$1"); shift ;;
+    esac
+  done
+  case "$minutes" in ''|*[!0-9]*) die "wait --minutes needs a whole number of minutes" ;; esac
+  if [ ${#names[@]} -gt 0 ]; then
+    pat="$(printf '%s|' "${names[@]}")"; pat="${pat%|}"
+  else
+    pat='[^ ]+'
+  fi
+  # `watch` emits done/blocked/vanished/stale lines for every settled lane; idle is
+  # left out on purpose -- a lane that is merely idle has not finished anything.
+  # grep -m1 closes the pipe after the first match, which ends the watcher.
+  local line
+  line="$(timeout "$((minutes * 60))" "${BASH_SOURCE[0]}" watch 2>/dev/null \
+    | grep -m1 -E "^LANE (${pat}) -> (done|blocked|vanished|stale)( |$)")" || true
+  if [ -n "$line" ]; then printf '%s\n' "$line"; return 0; fi
+  printf 'wait: no lane settled within %s min\n' "$minutes"
+  return 1
+}
+
 usage() { grep -E '^#   \./' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 load_conf
 case "${1:-status}" in
   status) cmd_status ;;
   watch)  cmd_watch ;;
+  wait)   shift; cmd_wait "$@" ;;
   plan)   shift; [ $# -ge 2 ] || die "plan needs <issue> <file>"; cmd_plan "$1" "$2" ;;
   deps)   shift; [ $# -ge 1 ] || die "deps needs <issue>"; cmd_deps "$1" ;;
   collisions) shift; cmd_collisions "$@" ;;

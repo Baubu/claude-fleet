@@ -43,6 +43,7 @@ Requires [Herdr](https://herdr.dev) (`HERDR_ENV=1`) and a git repository.
 ./.claude/herd.sh launch <n> <slug> # create a lane for issue <n>, end to end
 ./.claude/herd.sh brief <agent>     # (re)send the opening brief to an idle lane
 ./.claude/herd.sh watch             # event stream of lane state changes (incl. stale)
+./.claude/herd.sh wait [--minutes N] [agent...]  # block in the foreground until a lane settles
 ./.claude/herd.sh report [since]    # what the fleet did, for a human catching up
 ./.claude/herd.sh archive <agent>   # snapshot a lane's transcript, no teardown
 ./.claude/herd.sh recycle <agent>   # archive, then retire a fully-pushed lane (the chat is kept)
