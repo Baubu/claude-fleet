@@ -218,20 +218,44 @@ print("\n".join(out).strip())'
 # surface, plan's own count -- goes through here, so the split happens once.
 # Two landings once stopped on paperwork because
 # `- modify: src/i18n/he.ts, src/i18n/en.ts` was read as a single path.
+#
+# A parenthesised group is a note only when whitespace precedes it: Next.js
+# route groups (`src/app/(trainer)/page.tsx`) are part of the path and must
+# survive. Notes may nest (`(the (new) flag)`) and may contain commas.
 plan_paths() {
   python -c '
 import sys, re
+
+def strip_notes(s):
+    # Remove " (...)" groups, balanced, that follow whitespace. "(x)" glued to
+    # a path segment is the path.
+    out, depth, i = [], 0, 0
+    while i < len(s):
+        c = s[i]
+        if depth == 0 and c == "(" and i > 0 and s[i - 1].isspace():
+            depth = 1
+        elif depth > 0:
+            if c == "(": depth += 1
+            elif c == ")": depth -= 1
+        else:
+            out.append(c)
+        i += 1
+    return "".join(out)
+
+def first_path(part):
+    part = part.strip()
+    if part.startswith("`"):                      # `path` -- up to the closing tick
+        return part[1:].split("`", 1)[0].strip()
+    return part.split()[0].strip("`").rstrip(".;:") if part.split() else ""
+
 for line in sys.stdin.buffer.read().decode("utf-8", "replace").splitlines():
     m = re.match(r"^\s*[-*]?\s*(create|modify|delete):\s*(.*)$", line)
     if not m:
         continue
-    rest = re.sub(r"\([^)]*\)", " ", m.group(2))          # drop (notes)
-    rest = re.split(r"\s+(--|#|\u2014)\s+|\s+--\s*$", rest)[0]  # and trailing -- notes
+    rest = strip_notes(m.group(2))
+    rest = re.split(r"\s+(--|#|\u2014)\s+|\s+--\s*$", rest)[0]   # trailing -- notes
     for part in rest.split(","):
-        part = part.strip().strip("`").strip()
-        if not part:
-            continue
-        path = part.split()[0].strip("`").rstrip(".;:")
+        path = first_path(part)
         if path:
             print(path)' | tr -d '\r'   # Windows python prints CRLF through a pipe; grep -x would then never match
 }
@@ -855,7 +879,12 @@ cmd_check() {
     rec="$(record_check "$a" "$sha" "$rc" "$out" "$cmd")"
     echo "== check $word @${sha:0:7} -> $rec"
   else
-    echo "== check $word (not filed: the tree differs from HEAD)"
+    # Not a record -- the tree is not HEAD -- but keep the output where the
+    # gate and the PR body can still quote it.
+    mkdir -p "$CHECK_DIR"
+    { echo "agent: $a"; echo "sha: ${sha:-?} (tree differs from HEAD; not filed)"; echo "cmd: $cmd"; echo "rc: $rc"
+      echo "when: $(date -u +%Y-%m-%dT%H:%M:%SZ)"; echo "--- output tail ---"; tail -40 "$out"; } > "$CHECK_DIR/last-$a.log"
+    echo "== check $word (not filed: the tree differs from HEAD; output kept in $CHECK_DIR/last-$a.log)"
   fi
   rm -f "$out"
   return "$rc"
@@ -1174,7 +1203,7 @@ PLAN>>>"
 rebase_onto_main() {
   local a="$1" d="$2" b="$3" behind conflicts base changed
   REBASED=""; REBASE_FROM=""; REBASE_OVERLAP=""; REBASE_LOCKFILE=""
-  git -C "$d" fetch -q origin 2>/dev/null
+  [ -n "${HERD_SKIP_FETCH:-}" ] || git -C "$d" fetch -q origin 2>/dev/null   # prepare fetched once for all lanes
   behind="$(git -C "$d" rev-list --count HEAD..origin/main 2>/dev/null || echo 0)"
   [ "${behind:-0}" -gt 0 ] || return 0
   REBASE_FROM="$(git -C "$d" rev-parse HEAD)"
@@ -1288,12 +1317,22 @@ gate_for_landing() {
       fi
     fi
     if cmd_check "$a"; then
-      GATE_CHECK_FILE="$CHECK_DIR/$a-$sha.ok"
       GATE_CHECK_NOTE="PASS @$short, ran now${GATE_INSTALL_NOTE:+; $GATE_INSTALL_NOTE}"
+      if [ -s "$CHECK_DIR/$a-$sha.ok" ]; then
+        GATE_CHECK_FILE="$CHECK_DIR/$a-$sha.ok"
+      else
+        # The tree is content-clean (checked above), so what stopped the filing
+        # is an untracked, non-ignored file. The pass stands for this landing
+        # but is not on record for the next one.
+        GATE_CHECK_FILE="$CHECK_DIR/last-$a.log"
+        warn "check passed but no record was filed for @$short: '$a' has untracked files that are not ignored ($(git -C "$d" ls-files --others --exclude-standard 2>/dev/null | grep -v '^\.claude/' | head -3 | tr '\n' ' ' | sed 's/ $//')) -- commit or ignore them, or the next land runs the suite again"
+        GATE_CHECK_NOTE="$GATE_CHECK_NOTE (not filed: untracked files in the lane)"
+      fi
       gate_note check "PASS ran"
     else
-      warn "checks failed for '$a' -- not landing$([ -s "$CHECK_DIR/$a-$sha.fail" ] && printf ' (tail: %s)' "$CHECK_DIR/$a-$sha.fail")"
-      gate_note check FAIL; gate_note detail "$CHECK_DIR/$a-$sha.fail"; gate_note result check-failed
+      local failf="$CHECK_DIR/$a-$sha.fail"; [ -s "$failf" ] || failf="$CHECK_DIR/last-$a.log"
+      warn "checks failed for '$a' -- not landing (tail: $failf)"
+      gate_note check FAIL; gate_note detail "$failf"; gate_note result check-failed
       return 12
     fi
   fi
@@ -1548,6 +1587,9 @@ cmd_prepare() {
   [ ${#names[@]} -gt 0 ] || die "prepare needs one or more agents"
   mkdir -p "$ARCHIVE/prepare"
   echo "preparing ${#names[@]} lane(s) in parallel ($mode mode); logs in $ARCHIVE/prepare/" >&2
+  # One fetch for all lanes. The worktrees share .git, and several concurrent
+  # fetches contend for its lock; the gates below skip their own fetch.
+  git -C "$REPO" fetch -q origin 2>/dev/null || warn "git fetch origin failed; lanes rebase onto the origin/main already on disk"
   for a in "${names[@]}"; do
     prepare_one "$a" "$noreview" "$mode" &
     pids+=("$!")
@@ -1571,7 +1613,7 @@ prepare_one() {
     return 1
   fi
   b="$(git -C "$d" rev-parse --abbrev-ref HEAD)"
-  ( export HERD_GATE_STATUS="$st"; gate_for_landing "$a" "$d" "$b" "$noreview" "$mode" ) > "$log" 2>&1; rc=$?
+  ( export HERD_GATE_STATUS="$st" HERD_SKIP_FETCH=1; gate_for_landing "$a" "$d" "$b" "$noreview" "$mode" ) > "$log" 2>&1; rc=$?
   printf 'rc\t%s\n' "$rc" >> "$st"
   prepare_line "$a" "$st" "$log"
   return $rc
@@ -1702,9 +1744,12 @@ cmd_land_all() {
     shift
   done
   if [ ${#names[@]} -eq 0 ]; then
-    mapfile -t names < <(done_lanes)
+    # while-read rather than mapfile: macOS ships bash 3.2.
+    while IFS= read -r a; do [ -n "$a" ] && names+=("$a"); done < <(done_lanes)
     [ ${#names[@]} -gt 0 ] || die "land --all: no done lane (settled, ahead of origin/main, clean tree)"
-    mapfile -t names < <(order_by_overlap "${names[@]}")
+    local -a ordered=()
+    while IFS= read -r a; do [ -n "$a" ] && ordered+=("$a"); done < <(order_by_overlap "${names[@]}")
+    names=("${ordered[@]}")
     echo "done lanes, fewest shared files first: ${names[*]}" >&2
   fi
   cmd_prepare "--$mode" ${noreview:+--no-review} "${names[@]}" || true
