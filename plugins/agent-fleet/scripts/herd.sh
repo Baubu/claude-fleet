@@ -25,12 +25,14 @@
 #   ./.claude/herd.sh resume <agent>    # reopen a recycled lane's chat in a new pane, context intact
 #   ./.claude/herd.sh read <agent> [n]  # last n lines of an agent's transcript
 #   ./.claude/herd.sh say <agent> <txt> # prompt an agent
-#   ./.claude/herd.sh check <agent>     # lint+test+build that agent's worktree
-#   ./.claude/herd.sh review <agent>    # independent headless review; verdict to the issue
+#   ./.claude/herd.sh check <agent>     # lint+test+build that agent's worktree; the result is filed by commit
+#   ./.claude/herd.sh review <agent>    # independent headless review; verdict to the issue, filed by commit and patch-id
+#   ./.claude/herd.sh prepare <agent>... [--pr] [--no-review]   # check + review several lanes at once; one line per lane as each finishes
 #   ./.claude/herd.sh document <agent>  # post the lane's summary to its issue
 #   ./.claude/herd.sh pr <agent>        # check, review, push, open a PR with evidence, merge when CI is green
 #   ./.claude/herd.sh merge <agent>     # wait for the PR's checks, squash-merge it, update main
 #   ./.claude/herd.sh land <agent> [--pr] [--no-review] [--no-merge]   # check, review, summary, then squash (or PR + merge)
+#   ./.claude/herd.sh land --all [agent...] [--pr] [--no-merge]        # prepare every done lane, then land the ready ones in series
 #
 # fleet.conf keys (all optional):
 #   CHECK_CMD      lint + test + build command run inside a lane
@@ -40,6 +42,9 @@
 #   LAND_MODE      squash (default) | pr
 #   AUTO_MERGE     1 (default): in pr mode, land/pr wait for CI and merge -- the manager merges, not a person
 #   AUTO_RECYCLE   1 (default): merge then recycles the lane (archive, remove worktree + pane, drop local branch)
+#   RECHECK_AFTER_REBASE  1: re-run the check after a land-time rebase that was clean and touched none of
+#                  the lane's files; 0: keep the pass filed before the rebase and let CI on the PR gate the
+#                  merged result. Default 0 in pr mode, 1 in squash mode. A conflict or an overlap always re-checks.
 #   REVIEW_MODEL   model for `review` (default sonnet)
 #   STALE_MIN      minutes idle with no new commit before `watch` says stale (default 30)
 #   LANE_MODEL / LANE_EFFORT   defaults for launch when the plan and flags say nothing
@@ -75,6 +80,7 @@ load_conf() {
   LAND_MODE="${LAND_MODE:-squash}"
   AUTO_MERGE="${AUTO_MERGE:-1}"
   AUTO_RECYCLE="${AUTO_RECYCLE:-1}"
+  RECHECK_AFTER_REBASE="${RECHECK_AFTER_REBASE:-}"   # empty: 0 in pr mode, 1 in squash mode
   REVIEW_MODEL="${REVIEW_MODEL:-sonnet}"
   STALE_MIN="${STALE_MIN:-30}"
   LANE_MODEL="${LANE_MODEL:-}"
@@ -204,9 +210,59 @@ for line in sys.stdin.buffer.read().decode("utf-8", "replace").splitlines():
 print("\n".join(out).strip())'
 }
 
+# plan_paths -- read a plan's Files section on stdin, print one path per line.
+# A bullet may carry several comma-separated paths (`- modify: a.ts, b.ts`),
+# with or without backticks, and may trail a note after the path
+# (`- modify: a.ts (add the flag)`, `- create: b.ts -- the new table`).
+# Everything that reads Files -- plan_gap, collisions, the brief's collision
+# surface, plan's own count -- goes through here, so the split happens once.
+# Two landings once stopped on paperwork because
+# `- modify: src/i18n/he.ts, src/i18n/en.ts` was read as a single path.
+#
+# A parenthesised group is a note only when whitespace precedes it: Next.js
+# route groups (`src/app/(trainer)/page.tsx`) are part of the path and must
+# survive. Notes may nest (`(the (new) flag)`) and may contain commas.
+plan_paths() {
+  python -c '
+import sys, re
+
+def strip_notes(s):
+    # Remove " (...)" groups, balanced, that follow whitespace. "(x)" glued to
+    # a path segment is the path.
+    out, depth, i = [], 0, 0
+    while i < len(s):
+        c = s[i]
+        if depth == 0 and c == "(" and i > 0 and s[i - 1].isspace():
+            depth = 1
+        elif depth > 0:
+            if c == "(": depth += 1
+            elif c == ")": depth -= 1
+        else:
+            out.append(c)
+        i += 1
+    return "".join(out)
+
+def first_path(part):
+    part = part.strip()
+    if part.startswith("`"):                      # `path` -- up to the closing tick
+        return part[1:].split("`", 1)[0].strip()
+    return part.split()[0].strip("`").rstrip(".;:") if part.split() else ""
+
+for line in sys.stdin.buffer.read().decode("utf-8", "replace").splitlines():
+    m = re.match(r"^\s*[-*]?\s*(create|modify|delete):\s*(.*)$", line)
+    if not m:
+        continue
+    rest = strip_notes(m.group(2))
+    rest = re.split(r"\s+(--|#|\u2014)\s+|\s+--\s*$", rest)[0]   # trailing -- notes
+    for part in rest.split(","):
+        path = first_path(part)
+        if path:
+            print(path)' | tr -d '\r'   # Windows python prints CRLF through a pipe; grep -x would then never match
+}
+
 # plan_files <issue> -- one path per line from the plan's Files section.
 plan_files() {
-  plan_of "$1" | plan_section "Files" | sed -n 's/^[[:space:]]*[-*]\{0,1\}[[:space:]]*\(create\|modify\|delete\):[[:space:]]*`\{0,1\}\([^` ]*\)`\{0,1\}.*$/\2/p'
+  plan_of "$1" | plan_section "Files" | plan_paths
 }
 
 # plan_gap <worktree> <issue> -- files in the lane's diff that the plan's Files
@@ -249,7 +305,7 @@ cmd_plan() {
   done
   [ -z "$missing" ] || die "plan is missing required headings:$missing"
   local nfiles
-  nfiles="$(plan_section "Files" < "$file" | grep -cE '^[[:space:]]*[-*]?[[:space:]]*(create|modify|delete):' || true)"
+  nfiles="$(plan_section "Files" < "$file" | plan_paths | grep -c . || true)"
   [ "$nfiles" -gt 0 ] || die "plan's '## Files' must list at least one 'create:' or 'modify:' path"
   if [ "$nfiles" -gt 8 ]; then
     warn "plan lists $nfiles files -- consider splitting the issue before launching (see the skill: 'Plan before launch')"
@@ -290,7 +346,7 @@ cmd_collisions() {
   for n in $(printf '%s\n' $issues | sort -un); do
     plan_files "$n" | sed "s/\$/\t#$n/" >> "$tmp"
   done
-  python - "$tmp" <<'PY'
+  python - "$tmp" <<'PY' | tr -d '\r'
 import sys, collections
 by = collections.defaultdict(set)
 for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
@@ -303,7 +359,7 @@ for p in sorted(hits):
     print("%s\t%s" % (p, " ".join(hits[p])))
 sys.exit(1 if hits else 0)
 PY
-  local rc=$?
+  local rc=${PIPESTATUS[0]}
   rm -f "$tmp"
   return $rc
 }
@@ -664,6 +720,24 @@ provision_lane() {
   fi
 }
 
+# codegen_lane <dir> -- per-worktree codegen. `npm ci` does NOT do this unless
+# the project happens to have a postinstall hook, and a lane with an
+# ungenerated client fails its checks for reasons that have nothing to do with
+# its work -- which, now that landing is gated on checks, silently blocks a
+# lane that did nothing wrong. Diagnosing it is worse than it sounds: the
+# symptom surfaces as an unrelated assertion (`Prisma.join is not a function`
+# -> HTTP 500 -> "expected 200"), so it reads as a real product bug in
+# whatever test happens to touch it first. Run at launch, and again when a
+# land-time rebase brings in a lockfile change.
+codegen_lane() {
+  local dir="$1"
+  if [ -n "$CODEGEN_CMD" ]; then
+    ( cd "$dir" && eval "$CODEGEN_CMD" >/dev/null 2>&1 ) || die "codegen failed in $dir"
+  elif [ -f "$dir/prisma/schema.prisma" ]; then
+    ( cd "$dir" && npx prisma generate >/dev/null 2>&1 ) || die "prisma generate failed in $dir"
+  fi
+}
+
 # check_cmd_for <dir> -- the lint+test+build command for a worktree, as text.
 # CHECK_CMD wins; otherwise detect. Printed into the lane's brief so the lane can
 # run the same thing the manager will.
@@ -678,14 +752,142 @@ check_cmd_for() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# Result cache. A check or a review is a fact about one commit (or one diff),
+# and the same commit was being verified three times on its way to main -- in
+# the lane, in `land`, and in CI -- about fifteen minutes per lane, most of it
+# waiting. Each result is filed against what it verified, and `land` skips the
+# work whose inputs did not change, saying which filed result it used.
+#
+#   checks/<agent>-<sha>.ok|.fail     the check's outcome for that commit, with
+#                                     the tail of its output
+#   review-<agent>-<sha>.md           the review transcript (as before)
+#   reviews/patch-<patchid>.verdict   the verdict indexed by the lane diff's
+#                                     `git patch-id --stable`, so a review
+#                                     survives a clean rebase that leaves the
+#                                     lane's own diff as it was
+# ---------------------------------------------------------------------------
+
+CHECK_DIR="$ARCHIVE/checks"
+REVIEW_IDX="$ARCHIVE/reviews"
+
+# lane_patch_id <worktree> -- a stable id for the lane's own diff against main.
+# Hunk line numbers are left out of it, so a rebase over commits that did not
+# touch the lane's hunks keeps the id; one that did changes it.
+lane_patch_id() {
+  git -C "$1" diff origin/main...HEAD 2>/dev/null | git -C "$1" patch-id --stable 2>/dev/null | cut -d' ' -f1
+}
+
+# tree_matches_head <worktree> -- true when the working tree is exactly HEAD:
+# no content change and no untracked file (ignored paths and .claude/ do not
+# count). Only such a tree's result may be filed under HEAD's commit.
+tree_matches_head() {
+  [ "$(content_dirty "$1")" = 0 ] || return 1
+  [ -z "$(git -C "$1" ls-files --others --exclude-standard 2>/dev/null | grep -v '^\.claude/' | head -1)" ]
+}
+
+# record_check <agent> <sha> <rc> <output-file> <cmd> [carried-from]
+# File the outcome; print the record's path. A later record for the same
+# commit replaces the earlier one, so a flaky suite's last word is the one on
+# file. A record with `carried-from:` was not run on this commit: the gate
+# carried a pass over a clean rebase and filed it so the next command finds it
+# (and says so, rather than presenting it as a run).
+record_check() {
+  local a="$1" sha="$2" rc="$3" outf="$4" cmd="$5" from="${6:-}" f
+  mkdir -p "$CHECK_DIR"
+  rm -f "$CHECK_DIR/$a-$sha.ok" "$CHECK_DIR/$a-$sha.fail"
+  if [ "$rc" = 0 ]; then f="$CHECK_DIR/$a-$sha.ok"; else f="$CHECK_DIR/$a-$sha.fail"; fi
+  {
+    echo "agent: $a"
+    echo "sha: $sha"
+    echo "cmd: $cmd"
+    echo "rc: $rc"
+    [ -n "$from" ] && echo "carried-from: $from"
+    echo "when: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "epoch: $(date +%s)"
+    echo "--- output tail ---"
+    tail -40 "$outf"
+  } > "$f"
+  printf '%s' "$f"
+}
+
+# check_pass_for <agent> <worktree> <sha> -- true when a pass is on file for
+# that commit under the current check command. Sets CHECK_HIT (the record),
+# CHECK_HIT_AGE (minutes since it was filed) and CHECK_HIT_FROM (the commit it
+# actually ran on, when the record was carried over a rebase; else empty).
+check_pass_for() {
+  local a="$1" d="$2" sha="$3" f cmd when
+  CHECK_HIT=""; CHECK_HIT_AGE=""; CHECK_HIT_FROM=""
+  f="$CHECK_DIR/$a-$sha.ok"
+  [ -s "$f" ] || return 1
+  cmd="$(sed -n 's/^cmd: //p' "$f" | head -1)"
+  if [ "$cmd" != "$(check_cmd_for "$d")" ]; then
+    warn "pass on file for @${sha:0:7} ignored: the check command has changed since"
+    return 1
+  fi
+  when="$(sed -n 's/^epoch: //p' "$f" | head -1)"
+  CHECK_HIT="$f"; CHECK_HIT_AGE=$(( ($(date +%s) - ${when:-0}) / 60 ))
+  CHECK_HIT_FROM="$(sed -n 's/^carried-from: //p' "$f" | head -1)"
+  return 0
+}
+
+# check_tail <record> -- the output tail stored in a check record.
+check_tail() { sed -n '/^--- output tail ---$/,$p' "$1" | sed '1d'; }
+
+# review_merge_for <agent> <worktree> <short-sha> -- true when a MERGE verdict
+# is on file for this commit, or for a diff with the same patch-id (the lane
+# rebased cleanly over commits that left its hunks alone). Only MERGE is
+# reused: a FIX or ESCALATE is re-reviewed once the lane has moved. Sets
+# REVIEW_HIT (the transcript) and REVIEW_HIT_HOW (how it was matched).
+review_merge_for() {
+  local a="$1" d="$2" sha="$3" f pid v
+  REVIEW_HIT=""; REVIEW_HIT_HOW=""
+  f="$ARCHIVE/review-$a-$sha.md"
+  if [ -s "$f" ]; then
+    v="$(grep -oE '^(MERGE|FIX|ESCALATE)[[:space:]]*$' "$f" | tail -1 | tr -d '[:space:]')"
+    if [ "$v" = MERGE ]; then REVIEW_HIT="$f"; REVIEW_HIT_HOW="@$sha"; return 0; fi
+  fi
+  pid="$(lane_patch_id "$d")"
+  [ -n "$pid" ] || return 1
+  f="$REVIEW_IDX/patch-$pid.verdict"
+  [ -s "$f" ] || return 1
+  [ "$(head -1 "$f" | tr -d '[:space:]')" = MERGE ] || return 1
+  REVIEW_HIT="$(sed -n 's/^file: //p' "$f" | head -1)"
+  REVIEW_HIT_HOW="patch-id ${pid:0:7}, reviewed @$(sed -n 's/^sha: //p' "$f" | head -1)"
+  return 0
+}
+
+# check <agent> -- run the lint+test+build command in the lane and file the
+# outcome under checks/<agent>-<sha>.ok|.fail with the tail of its output. It
+# always runs; `land` and `prepare` are what consult the record. The outcome
+# is filed only when the tree is exactly HEAD -- a dirty tree's pass says
+# nothing about the commit.
 cmd_check() {
-  local d cmd; d="$(wt_of "$1")"
-  [ -n "$d" ] && [ -d "$d" ] || die "no worktree for agent '$1'"
-  echo "== $1 -> $d"
+  local a="$1" d cmd sha out rc rec word
+  d="$(wt_of "$a")"
+  [ -n "$d" ] && [ -d "$d" ] || die "no worktree for agent '$a'"
+  echo "== $a -> $d"
   cmd="$(check_cmd_for "$d")"
   [ -n "$cmd" ] || die "no CHECK_CMD in .claude/fleet.conf and no known project type in $d"
   echo "== $cmd"
-  ( cd "$d" && eval "$cmd" )
+  sha="$(git -C "$d" rev-parse HEAD 2>/dev/null)"
+  out="$(mktemp)"
+  ( cd "$d" && eval "$cmd" ) 2>&1 | tee "$out"
+  rc=${PIPESTATUS[0]}
+  word=FAIL; [ "$rc" = 0 ] && word=PASS
+  if [ -n "$sha" ] && tree_matches_head "$d"; then
+    rec="$(record_check "$a" "$sha" "$rc" "$out" "$cmd")"
+    echo "== check $word @${sha:0:7} -> $rec"
+  else
+    # Not a record -- the tree is not HEAD -- but keep the output where the
+    # gate and the PR body can still quote it.
+    mkdir -p "$CHECK_DIR"
+    { echo "agent: $a"; echo "sha: ${sha:-?} (tree differs from HEAD; not filed)"; echo "cmd: $cmd"; echo "rc: $rc"
+      echo "when: $(date -u +%Y-%m-%dT%H:%M:%SZ)"; echo "--- output tail ---"; tail -40 "$out"; } > "$CHECK_DIR/last-$a.log"
+    echo "== check $word (not filed: the tree differs from HEAD; output kept in $CHECK_DIR/last-$a.log)"
+  fi
+  rm -f "$out"
+  return "$rc"
 }
 
 # ---------------------------------------------------------------------------
@@ -767,18 +969,7 @@ cmd_launch() {
 
   provision_lane "$dir"
 
-  # Codegen, per worktree. `npm ci` does NOT do this unless the project happens
-  # to have a postinstall hook, and a lane with an ungenerated client fails its
-  # checks for reasons that have nothing to do with its work -- which, now that
-  # landing is gated on checks, silently blocks a lane that did nothing wrong.
-  # Diagnosing it is worse than it sounds: the symptom surfaces as an unrelated
-  # assertion (`Prisma.join is not a function` -> HTTP 500 -> "expected 200"),
-  # so it reads as a real product bug in whatever test happens to touch it first.
-  if [ -n "$CODEGEN_CMD" ]; then
-    ( cd "$dir" && eval "$CODEGEN_CMD" >/dev/null 2>&1 ) || die "codegen failed in $dir"
-  elif [ -f "$dir/prisma/schema.prisma" ]; then
-    ( cd "$dir" && npx prisma generate >/dev/null 2>&1 ) || die "prisma generate failed in $dir"
-  fi
+  codegen_lane "$dir"   # see the note on codegen_lane
 
   start_lane_agent "$name" "$pane" "$model" "$effort" \
     || die "agent start failed for $name -- the lane exists; once the agent is idle, send the brief with: ./.claude/herd.sh brief $name"
@@ -981,6 +1172,15 @@ PLAN>>>"
   ( cd "$d" && claude -p "$task" --model "$REVIEW_MODEL" --allowedTools Read Grep Glob Bash --append-system-prompt "$sys" < /dev/null ) > "$out" 2>"$out.err"
   verdict="$(grep -oE '^(MERGE|FIX|ESCALATE)[[:space:]]*$' "$out" | tail -1 | tr -d '[:space:]')"
   case "$verdict" in MERGE) rc=0 ;; FIX) rc=2 ;; ESCALATE) rc=3 ;; *) verdict="NO VERDICT"; rc=3 ;; esac
+  # Index the verdict by the diff it judged, not only by the commit: a clean
+  # rebase gives the lane a new sha and the same diff, and this is what lets
+  # `land` tell the two apart.
+  local pid; pid="$(lane_patch_id "$d")"
+  if [ -n "$pid" ]; then
+    mkdir -p "$REVIEW_IDX"
+    { echo "$verdict"; echo "agent: $a"; echo "sha: $sha"; echo "file: $out"; echo "when: $(date -u +%Y-%m-%dT%H:%M:%SZ)"; } \
+      > "$REVIEW_IDX/patch-$pid.verdict"
+  fi
   if [ -z "$nopost" ] && [ -n "$issue" ] && command -v gh >/dev/null 2>&1; then
     { echo "$REVIEW_MARK"; echo "**Independent review** of \`$b\` @$sha (herd.sh review, $REVIEW_MODEL): **$verdict**"; echo; cat "$out"; } \
       | ghr issue comment "$issue" --body-file - >/dev/null || warn "could not post the review to #$issue"
@@ -995,50 +1195,195 @@ PLAN>>>"
 # the checks run on what will actually merge. A clean rebase is silent; a
 # conflicting one is aborted and handed to the lane that wrote the code, since
 # it holds the context to resolve it.
+#
+# Leaves REBASED (1 when the branch moved), REBASE_FROM (the pre-rebase
+# commit) and REBASE_OVERLAP (files main changed since the old base that the
+# lane also changes; empty for a disjoint rebase). Returns 1 on a conflict,
+# after handing it to the lane.
 rebase_onto_main() {
-  local a="$1" d="$2" b="$3" behind conflicts
-  git -C "$d" fetch -q origin 2>/dev/null
+  local a="$1" d="$2" b="$3" behind conflicts base changed
+  REBASED=""; REBASE_FROM=""; REBASE_OVERLAP=""; REBASE_LOCKFILE=""
+  [ -n "${HERD_SKIP_FETCH:-}" ] || git -C "$d" fetch -q origin 2>/dev/null   # prepare fetched once for all lanes
   behind="$(git -C "$d" rev-list --count HEAD..origin/main 2>/dev/null || echo 0)"
   [ "${behind:-0}" -gt 0 ] || return 0
+  REBASE_FROM="$(git -C "$d" rev-parse HEAD)"
+  base="$(git -C "$d" merge-base HEAD origin/main 2>/dev/null)"
   echo "rebasing '$b' onto origin/main ($behind commits behind)..." >&2
-  if git -C "$d" rebase -q origin/main >/dev/null 2>&1; then return 0; fi
+  if git -C "$d" rebase -q origin/main >/dev/null 2>&1; then
+    REBASED=1
+    changed="$(git -C "$d" diff --name-only "$base" origin/main 2>/dev/null | sort -u)"
+    # Both lists are git's, not the plan's. An empty intersection is what lets
+    # the pass filed before the rebase stand (see gate_for_landing).
+    REBASE_OVERLAP="$(comm -12 \
+      <(printf '%s\n' "$changed") \
+      <(git -C "$d" diff --name-only origin/main...HEAD 2>/dev/null | sort -u) | tr '\n' ' ' | sed 's/ $//')"
+    # A lockfile main changed is a dependency the lane's install predates. Seen
+    # live: a sibling lane added a package, and the next lane's check failed
+    # with "Cannot find module" for a reason that had nothing to do with its
+    # work. The gate reinstalls before checking when this is set.
+    REBASE_LOCKFILE="$(printf '%s\n' "$changed" \
+      | grep -E '(^|/)(package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|uv\.lock|poetry\.lock|Pipfile\.lock|Cargo\.lock|wally\.lock|go\.sum)$' \
+      | tr '\n' ' ' | sed 's/ $//')"
+    return 0
+  fi
   conflicts="$(git -C "$d" diff --name-only --diff-filter=U | tr '\n' ' ')"
   git -C "$d" rebase --abort >/dev/null 2>&1
   herdr agent prompt "$a" "Your branch $b is $behind commits behind origin/main and rebasing it conflicts in: $conflicts. Run 'git fetch origin && git rebase origin/main', resolve every conflict keeping both sides' intent (regenerate lockfiles with the toolchain instead of hand-merging them), re-run the project's checks, finish the rebase, and update .claude/lane-summary.md. Do not force-push; the manager will. Reply with what you resolved." >/dev/null 2>&1
-  die "rebase of '$b' conflicts in: $conflicts -- sent to the lane; land again when it reports done"
+  warn "rebase of '$b' conflicts in: $conflicts -- sent to the lane; land again when it reports done"
+  return 1
 }
 
-# gate_for_landing <agent> <worktree> <branch> [--no-review]
-# Everything both `land` and `pr` require before touching main or the forge.
+# gate_note <key> <value> -- record a gate step for `prepare`, which runs the
+# gate in a background subshell and reads the outcome back from a file.
+gate_note() {
+  [ -n "${HERD_GATE_STATUS:-}" ] && printf '%s\t%s\n' "$1" "$2" >> "$HERD_GATE_STATUS"
+  return 0
+}
+
+# gate_for_landing <agent> <worktree> <branch> [noreview] [mode]
+# Everything both `land` and `pr` require before touching main or the forge:
+# a clean tree, the rebase, the check, the closing summary, the plan gap, the
+# review. Returns 0 when the lane is ready. Otherwise it says why on stderr,
+# hands the lane what it needs (a conflict, a plan gap, a FIX) and returns a
+# code `prepare` can name:
+#   10 on main or dirty   11 rebase conflict   12 checks failed
+#   13 no summary         14 plan gap          15 review FIX   16 ESCALATE or no verdict
+# Leaves, for the PR body: GATE_SHA, GATE_CHECK_NOTE, GATE_CHECK_FILE,
+# GATE_CHECK_CARRIED, GATE_REVIEW_NOTE, GATE_REVIEW_VERDICT, GATE_REVIEW_FILE.
 gate_for_landing() {
-  local a="$1" d="$2" b="$3" noreview="${4:-}" rc
-  [ "$b" = main ] && die "'$a' is on main -- refusing"
-  [ "$(content_dirty "$d")" = 0 ] || die "'$a' has uncommitted changes; commit or stash first"
-  rebase_onto_main "$a" "$d" "$b"
-  cmd_check "$a" || die "checks failed for '$a' -- not landing"
+  local a="$1" d="$2" b="$3" noreview="${4:-}" mode="${5:-$LAND_MODE}" rc sha short recheck
+  GATE_SHA=""; GATE_CHECK_NOTE=""; GATE_CHECK_FILE=""; GATE_CHECK_CARRIED=""; GATE_CHECK_FROM=""
+  GATE_REVIEW_NOTE=""; GATE_REVIEW_VERDICT=""; GATE_REVIEW_FILE=""; GATE_INSTALL_NOTE=""
+  gate_note stage preflight
+  [ "$b" = main ] && { warn "'$a' is on main -- refusing"; gate_note result main; return 10; }
+  [ "$(content_dirty "$d")" = 0 ] || { warn "'$a' has uncommitted changes; commit or stash first"; gate_note result dirty; return 10; }
+  gate_note stage rebase
+  rebase_onto_main "$a" "$d" "$b" || { gate_note result conflict; return 11; }
+  sha="$(git -C "$d" rev-parse HEAD)"; short="$(git -C "$d" rev-parse --short HEAD)"
+  GATE_SHA="$sha"; gate_note sha "$short"
+
+  # Dependencies. A rebase that brought in a lockfile change leaves the lane's
+  # install behind it, and the check then fails on a missing module that is
+  # nobody's bug. Reinstall (and regenerate) before checking, and say so.
+  if [ -n "$REBASE_LOCKFILE" ]; then
+    gate_note stage install
+    echo "the rebase changed $REBASE_LOCKFILE; reinstalling the lane's dependencies before the check" >&2
+    if ! ( provision_lane "$d" && codegen_lane "$d" ); then
+      warn "dependency install failed in '$a' after the rebase changed $REBASE_LOCKFILE -- not landing"
+      gate_note detail "$REBASE_LOCKFILE"; gate_note result install-failed
+      return 17
+    fi
+    GATE_INSTALL_NOTE="dependencies reinstalled after the rebase changed $REBASE_LOCKFILE"
+    gate_note install "$REBASE_LOCKFILE"
+  fi
+
+  # The check. A pass filed for this exact commit stands. After a clean rebase
+  # that changed none of the lane's files, the pass filed for the pre-rebase
+  # commit stands too in PR mode, where CI runs on the merged result anyway --
+  # running it here as well is the third run of the same suite on the same
+  # work. A conflict or an overlap always re-runs it; RECHECK_AFTER_REBASE=1
+  # (the squash-mode default, where there is no CI behind the merge) always does.
+  gate_note stage check
+  recheck="$RECHECK_AFTER_REBASE"
+  case "$recheck" in 0|1) ;; "") ;; *) warn "RECHECK_AFTER_REBASE must be 0 or 1 (got '$recheck'); using the default"; recheck="" ;; esac
+  if [ -z "$recheck" ]; then if [ "$mode" = pr ]; then recheck=0; else recheck=1; fi; fi
+  # A record carried over an earlier rebase counts only where a carry is
+  # allowed now (RECHECK_AFTER_REBASE=0): it was never run on this commit.
+  if check_pass_for "$a" "$d" "$sha" && { [ -z "$CHECK_HIT_FROM" ] || [ "$recheck" = 0 ]; }; then
+    GATE_CHECK_FILE="$CHECK_HIT"
+    if [ -n "$CHECK_HIT_FROM" ]; then
+      GATE_CHECK_CARRIED=1; GATE_CHECK_FROM="$CHECK_HIT_FROM"
+      GATE_CHECK_NOTE="PASS @${CHECK_HIT_FROM:0:7}, carried to @$short over a clean rebase, filed ${CHECK_HIT_AGE} min ago, not re-run"
+      gate_note check "PASS carried"
+    else
+      GATE_CHECK_NOTE="PASS @$short, filed ${CHECK_HIT_AGE} min ago, not re-run"
+      gate_note check "PASS cached"
+    fi
+  elif [ -n "$REBASED" ] && [ -z "$REBASE_OVERLAP" ] && [ -z "$REBASE_LOCKFILE" ] && [ "$recheck" = 0 ] && check_pass_for "$a" "$d" "$REBASE_FROM"; then
+    # File the carried pass under the new commit, marked as carried, so the
+    # `land` that follows this `prepare` finds it instead of running the suite.
+    GATE_CHECK_CARRIED=1; GATE_CHECK_FROM="${CHECK_HIT_FROM:-$REBASE_FROM}"
+    local carried_tail; carried_tail="$(mktemp)"; check_tail "$CHECK_HIT" > "$carried_tail"
+    GATE_CHECK_FILE="$(record_check "$a" "$sha" 0 "$carried_tail" "$(check_cmd_for "$d")" "$GATE_CHECK_FROM")"
+    rm -f "$carried_tail"
+    GATE_CHECK_NOTE="PASS @${GATE_CHECK_FROM:0:7}, carried over a clean rebase that touched none of this lane's files (RECHECK_AFTER_REBASE=0); CI on the PR gates the merged result"
+    gate_note check "PASS carried"
+  else
+    if [ -n "$REBASED" ]; then
+      if [ -n "$REBASE_OVERLAP" ]; then echo "the rebase changed files this lane also touches ($REBASE_OVERLAP); running the check again" >&2
+      elif [ -n "$REBASE_LOCKFILE" ]; then echo "the rebase changed the dependencies under this lane ($REBASE_LOCKFILE); running the check again" >&2
+      elif [ "$recheck" = 1 ]; then echo "running the check again after the rebase (RECHECK_AFTER_REBASE=1)" >&2
+      else echo "no pass on file for the pre-rebase commit @${REBASE_FROM:0:7}; running the check" >&2
+      fi
+    fi
+    if cmd_check "$a"; then
+      GATE_CHECK_NOTE="PASS @$short, ran now${GATE_INSTALL_NOTE:+; $GATE_INSTALL_NOTE}"
+      if [ -s "$CHECK_DIR/$a-$sha.ok" ]; then
+        GATE_CHECK_FILE="$CHECK_DIR/$a-$sha.ok"
+      else
+        # The tree is content-clean (checked above), so what stopped the filing
+        # is an untracked, non-ignored file. The pass stands for this landing
+        # but is not on record for the next one.
+        GATE_CHECK_FILE="$CHECK_DIR/last-$a.log"
+        warn "check passed but no record was filed for @$short: '$a' has untracked files that are not ignored ($(git -C "$d" ls-files --others --exclude-standard 2>/dev/null | grep -v '^\.claude/' | head -3 | tr '\n' ' ' | sed 's/ $//')) -- commit or ignore them, or the next land runs the suite again"
+        GATE_CHECK_NOTE="$GATE_CHECK_NOTE (not filed: untracked files in the lane)"
+      fi
+      gate_note check "PASS ran"
+    else
+      local failf="$CHECK_DIR/$a-$sha.fail"; [ -s "$failf" ] || failf="$CHECK_DIR/last-$a.log"
+      warn "checks failed for '$a' -- not landing (tail: $failf)"
+      gate_note check FAIL; gate_note detail "$failf"; gate_note result check-failed
+      return 12
+    fi
+  fi
+  echo "check: $GATE_CHECK_NOTE" >&2
+
   # The summary is captured BEFORE the review so the deviations gate below can
   # read it, and so the reviewer judges the summary the owner will actually see.
-  capture_summary "$a" "$d" || die "'$a' wrote no closing summary -- not landing an undocumented merge"
+  gate_note stage summary
+  if ! capture_summary "$a" "$d"; then
+    warn "'$a' wrote no closing summary -- not landing an undocumented merge"
+    gate_note result no-summary; return 13
+  fi
   local gap issue_n
   issue_n="$(issue_of_branch "$b")"
   gap="$(plan_gap "$d" "${issue_n:-0}")"
   if [ -n "$gap" ]; then
     herdr agent prompt "$a" "Before the review can run: these files are in your diff but are not in the plan's Files list and are not mentioned under '## Deviations from plan' in .claude/lane-summary.md: $(printf '%s' "$gap" | tr '\n' ' '). Add one line per file there saying why it was needed, or revert the file if it was not. Do not change anything else. Report done when the summary is updated." >/dev/null 2>&1 \
       || echo "warning: could not prompt '$a'" >&2
-    die "plan gap for '$a' -- $(printf '%s' "$gap" | tr '\n' ' ') not in the plan or the summary; sent to the lane, land again when it reports done"
+    warn "plan gap for '$a' -- $(printf '%s' "$gap" | tr '\n' ' ') not in the plan or the summary; sent to the lane, land again when it reports done"
+    gate_note detail "$(printf '%s' "$gap" | tr '\n' ' ')"; gate_note result gap; return 14
   fi
+
+  # The review. A MERGE on file for this commit, or for this exact diff under
+  # an earlier commit (a clean rebase), is reused; anything else runs.
   if [ -z "$noreview" ]; then
-    cmd_review "$a"; rc=$?
-    case $rc in
-      0) ;;
-      2) herdr agent prompt "$a" "An independent review of your branch returned FIX. Read the latest comment on issue $(issue_of_branch "$b") that begins '$REVIEW_MARK', address every finding, commit, re-run the checks, and update .claude/lane-summary.md. Then reply with what you changed." >/dev/null 2>&1
-         die "review returned FIX for '$a' -- findings sent to the lane; land again when it has addressed them" ;;
-      *) die "review returned ESCALATE (or no verdict) for '$a' -- read $ARCHIVE/review-${a}-*.md and decide" ;;
-    esac
+    gate_note stage review
+    if review_merge_for "$a" "$d" "$short"; then
+      GATE_REVIEW_VERDICT=MERGE; GATE_REVIEW_FILE="$REVIEW_HIT"
+      GATE_REVIEW_NOTE="on file: $REVIEW_HIT_HOW; not re-run"
+      gate_note review "MERGE cached"
+    else
+      cmd_review "$a"; rc=$?
+      GATE_REVIEW_FILE="$ARCHIVE/review-${a}-${short}.md"
+      case $rc in
+        0) GATE_REVIEW_VERDICT=MERGE; GATE_REVIEW_NOTE="ran now"; gate_note review "MERGE ran" ;;
+        2) herdr agent prompt "$a" "An independent review of your branch returned FIX. Read the latest comment on issue $(issue_of_branch "$b") that begins '$REVIEW_MARK', address every finding, commit, re-run the checks, and update .claude/lane-summary.md. Then reply with what you changed." >/dev/null 2>&1
+           warn "review returned FIX for '$a' -- findings sent to the lane; land again when it has addressed them"
+           gate_note review FIX; gate_note detail "$GATE_REVIEW_FILE"; gate_note result fix; return 15 ;;
+        *) warn "review returned ESCALATE (or no verdict) for '$a' -- read $GATE_REVIEW_FILE and decide"
+           gate_note review ESCALATE; gate_note detail "$GATE_REVIEW_FILE"; gate_note result escalate; return 16 ;;
+      esac
+    fi
+    echo "review: MERGE ($GATE_REVIEW_NOTE)" >&2
+  else
+    gate_note review skipped
   fi
   # Documentation is a landing requirement, not a later cleanup; it was captured
   # above, before the review, while the agent that knows the answers is alive.
-  [ -s "$d/.claude/lane-summary.md" ] || die "'$a' wrote no closing summary -- not landing an undocumented merge"
+  [ -s "$d/.claude/lane-summary.md" ] || { warn "'$a' wrote no closing summary -- not landing an undocumented merge"; gate_note result no-summary; return 13; }
+  gate_note result ready
+  return 0
 }
 
 # merge <agent> [--no-wait] -- wait for the lane's PR checks, squash-merge it,
@@ -1071,6 +1416,12 @@ cmd_merge() {
       echo "waiting for $nchecks check(s) on #$n..." >&2
       ghr pr checks "$n" --watch --fail-fast >/dev/null 2>&1; rc=$?
       [ $rc -eq 0 ] || die "checks failed on #$n -- not merging (gh pr checks $n); send the failure to the lane and land again"
+    elif [ -n "${GATE_CHECK_CARRIED:-}" ]; then
+      # The pass was carried over the rebase on the strength of CI running on
+      # the merged result. There is no CI, so the merged result has never been
+      # checked: run it now rather than merge something nothing has seen.
+      warn "#$n has no CI checks and the local pass was carried over the rebase; running the check on the rebased branch now"
+      cmd_check "$a" || die "checks failed on the rebased '$b' -- not merging; send the failure to the lane and land again"
     else
       warn "#$n has no CI checks; merging on the manager's local verification and the review"
     fi
@@ -1119,7 +1470,7 @@ cmd_pr() {
     if [ "$AUTO_RECYCLE" = 1 ]; then cmd_recycle "$a"; fi
     return 0
   fi
-  gate_for_landing "$a" "$d" "$b" "$noreview"
+  gate_for_landing "$a" "$d" "$b" "$noreview" pr || exit 1
   # --force-with-lease because the gate may have rebased the branch; the lease
   # still refuses to overwrite anything pushed by someone else since our fetch.
   git -C "$d" push -u --force-with-lease origin "$b" >/dev/null 2>&1 || die "push of '$b' failed"
@@ -1127,20 +1478,27 @@ cmd_pr() {
   [ -n "$title" ] || title="$b"
   mkdir -p "$ARCHIVE"
   body="$ARCHIVE/pr-${a}.md"
-  checkout="$(cmd_check "$a" 2>&1 | tail -25)"
-  verdict="$(ls -t "$ARCHIVE"/review-"$a"-*.md 2>/dev/null | head -1 | xargs -r grep -oE '^(MERGE|FIX|ESCALATE)[[:space:]]*$' | tail -1 | tr -d '[:space:]')"
+  # The check output comes from the record the gate used -- the run it made or
+  # the one it found on file -- not from a further run of the same suite.
+  checkout=""; [ -s "$GATE_CHECK_FILE" ] && checkout="$(check_tail "$GATE_CHECK_FILE" | tail -25)"
+  verdict="$GATE_REVIEW_VERDICT"
+  [ -n "$verdict" ] || verdict="$(ls -t "$ARCHIVE"/review-"$a"-*.md 2>/dev/null | head -1 | xargs -r grep -oE '^(MERGE|FIX|ESCALATE)[[:space:]]*$' | tail -1 | tr -d '[:space:]')"
   {
     cat "$d/.claude/lane-summary.md"
     echo
     echo "## Manager verification"
     echo
-    echo "Re-run by the manager, not copied from the lane:"
+    if [ -n "$GATE_CHECK_CARRIED" ]; then
+      echo "The manager's check passed on \`${GATE_CHECK_FROM:0:7}\`, before the land-time rebase. The rebase onto main was clean and touched none of this lane's files, so the check was not run again locally (\`RECHECK_AFTER_REBASE=0\`): **CI on this pull request is the gate for the merged result.** Output of that run:"
+    else
+      echo "Re-run by the manager, not copied from the lane (${GATE_CHECK_NOTE:-check}):"
+    fi
     echo
     echo '```'
     echo "$checkout"
     echo '```'
     echo
-    [ -n "$verdict" ] && echo "Independent review verdict: **$verdict** (see the issue comment)."
+    [ -n "$verdict" ] && echo "Independent review verdict: **$verdict**${GATE_REVIEW_NOTE:+ ($GATE_REVIEW_NOTE)}; see the issue comment."
     echo
     [ -n "$issue" ] && echo "Closes #$issue"
   } > "$body"
@@ -1164,8 +1522,9 @@ cmd_pr() {
 
 # land <agent> [--pr] [--no-review] [--no-merge] -- check, review, require a
 # summary, then either stage a squash onto main (default) or open a PR and merge
-# it when CI is green (LAND_MODE=pr / --pr).
+# it when CI is green (LAND_MODE=pr / --pr). `land --all` is below.
 cmd_land() {
+  if [ "${1:-}" = --all ]; then shift; cmd_land_all "$@"; return $?; fi
   local a="$1"; shift
   local mode="$LAND_MODE" noreview="" nomerge=""
   while [ $# -gt 0 ]; do
@@ -1186,13 +1545,232 @@ cmd_land() {
   b="$(git -C "$d" rev-parse --abbrev-ref HEAD)"
   git -C "$REPO" rev-parse --abbrev-ref HEAD | grep -qx main || die "manager checkout is not on main"
   [ "$(content_dirty "$REPO")" = 0 ] || die "main checkout has uncommitted content changes"
-  gate_for_landing "$a" "$d" "$b" "$noreview"
+  gate_for_landing "$a" "$d" "$b" "$noreview" squash || exit 1
   git -C "$REPO" merge --squash "$b" || die "squash merge hit conflicts -- resolve in the main checkout"
   echo "Staged squash of '$b'. Review with: git -C \"$REPO\" diff --cached"
   echo "Then commit, and post the summary to the issue with:"
   echo "  ./.claude/herd.sh document $a"
   echo "Tear the lane down (only when disk or clutter demands it) with:"
   echo "  herdr worktree remove --workspace <wN> --force && git -C \"$REPO\" branch -D $b"
+}
+
+# ---------------------------------------------------------------------------
+# Prepare and land --all. Landing was serial end to end: check, review, PR,
+# CI, merge, then the next lane's rebase, about fifteen minutes a lane with the
+# manager mostly waiting. The verification does not have to be serial -- only
+# the merge does. `prepare` runs the whole gate for several lanes at once and
+# files every result; `land` then finds its check and review already on file
+# and goes straight to the push, the PR and the merge.
+# ---------------------------------------------------------------------------
+
+# sv <status-file> <key> -- the last value recorded for a key.
+sv() { awk -F'\t' -v k="$2" '$1==k{v=$2} END{print v}' "$1" 2>/dev/null; }
+
+# prepare <agent>... [--pr|--squash] [--no-review] -- run the landing gate for
+# several lanes concurrently, each in its own worktree: rebase, check, closing
+# summary, plan gap, review. One line per lane, printed as that lane finishes.
+# A conflict, a plan gap or a FIX goes to the lane at once, as `land` does.
+# Logs under fleet-archive/prepare/<agent>.log. Exit 0 when every lane is ready.
+cmd_prepare() {
+  local mode="$LAND_MODE" noreview="" a
+  local -a names=() pids=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --pr) mode=pr ;;
+      --squash) mode=squash ;;
+      --no-review) noreview=1 ;;
+      -*) die "unknown prepare option: $1" ;;
+      *) names+=("$1") ;;
+    esac
+    shift
+  done
+  [ ${#names[@]} -gt 0 ] || die "prepare needs one or more agents"
+  mkdir -p "$ARCHIVE/prepare"
+  echo "preparing ${#names[@]} lane(s) in parallel ($mode mode); logs in $ARCHIVE/prepare/" >&2
+  # One fetch for all lanes. The worktrees share .git, and several concurrent
+  # fetches contend for its lock; the gates below skip their own fetch.
+  git -C "$REPO" fetch -q origin 2>/dev/null || warn "git fetch origin failed; lanes rebase onto the origin/main already on disk"
+  for a in "${names[@]}"; do
+    prepare_one "$a" "$noreview" "$mode" &
+    pids+=("$!")
+  done
+  local rc=0 p
+  for p in "${pids[@]}"; do wait "$p" || rc=1; done
+  return $rc
+}
+
+# prepare_one <agent> [noreview] [mode] -- one lane's gate, logged, and its
+# outcome as one line. The gate runs in a subshell so a helper's `die` ends
+# only this lane; the status file says how far it got.
+prepare_one() {
+  local a="$1" noreview="${2:-}" mode="${3:-$LAND_MODE}" d b log st rc
+  log="$ARCHIVE/prepare/$a.log"; st="$ARCHIVE/prepare/$a.status"
+  : > "$st"
+  d="$(wt_of "$a")"
+  if [ -z "$d" ] || [ ! -d "$d" ]; then
+    printf 'result\tno-worktree\n' >> "$st"
+    printf 'prepare %s: NO WORKTREE for that agent\n' "$a"
+    return 1
+  fi
+  b="$(git -C "$d" rev-parse --abbrev-ref HEAD)"
+  ( export HERD_GATE_STATUS="$st" HERD_SKIP_FETCH=1; gate_for_landing "$a" "$d" "$b" "$noreview" "$mode" ) > "$log" 2>&1; rc=$?
+  printf 'rc\t%s\n' "$rc" >> "$st"
+  prepare_line "$a" "$st" "$log"
+  return $rc
+}
+
+# prepare_line <agent> <status-file> <log> -- "prepare <agent> @sha: check PASS
+# (cached) -- review MERGE (cached) -- READY", or where it stopped and why.
+prepare_line() {
+  local a="$1" st="$2" log="$3" sha res check review detail rc stage head out install
+  sha="$(sv "$st" sha)"; res="$(sv "$st" result)"; check="$(sv "$st" check)"; install="$(sv "$st" install)"
+  review="$(sv "$st" review)"; detail="$(sv "$st" detail)"; rc="$(sv "$st" rc)"; stage="$(sv "$st" stage)"
+  head="prepare $a${sha:+ @$sha}:"
+  out=""
+  [ -n "$install" ] && out="deps reinstalled ($install changed on main)"
+  case "$check" in
+    "") ;;
+    FAIL) out="${out:+$out -- }check FAIL" ;;
+    PASS\ *) out="${out:+$out -- }check PASS (${check#PASS })" ;;
+    *) out="${out:+$out -- }check $check" ;;
+  esac
+  case "$review" in
+    "") ;;
+    MERGE\ *) out="${out:+$out -- }review MERGE (${review#MERGE })" ;;
+    skipped) out="${out:+$out -- }review skipped (--no-review)" ;;
+    *) out="${out:+$out -- }review $review" ;;
+  esac
+  case "$res" in
+    ready)        out="$out -- READY" ;;
+    main)         out="on main -- refusing" ;;
+    dirty)        out="DIRTY (uncommitted changes)" ;;
+    conflict)     out="rebase CONFLICT -- sent to the lane (log: $log)" ;;
+    check-failed) out="$out -- tail: $detail" ;;
+    install-failed) out="${out:+$out -- }dependency INSTALL FAILED after the rebase changed $detail (log: $log)" ;;
+    no-summary)   out="${out:+$out -- }NO SUMMARY from the lane (log: $log)" ;;
+    gap)          out="${out:+$out -- }plan GAP ($detail) -- sent to the lane" ;;
+    fix)          out="$out -- sent to the lane ($detail)" ;;
+    escalate)     out="$out -- read $detail" ;;
+    no-worktree)  out="NO WORKTREE" ;;
+    *)            out="${out:+$out -- }FAILED during ${stage:-start} (rc ${rc:-?}) -- log: $log" ;;
+  esac
+  printf '%s %s\n' "$head" "$out"
+}
+
+# lane_agents -- "name<TAB>state<TAB>cwd" for every Herdr agent whose cwd is
+# under this repository's worktree directory. The Herdr session is shared
+# across repositories; other fleets' lanes are not ours to land.
+lane_agents() {
+  herdr agent list 2>/dev/null | HERD_WT="$WT" python -c '
+import sys, json, os
+wt = os.path.normcase(os.path.abspath(os.environ["HERD_WT"])).replace("\\", "/").rstrip("/") + "/"
+try:
+    rows = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace"))["result"]["agents"]
+except Exception:
+    rows = []
+for a in rows:
+    n, cwd = a.get("name"), a.get("cwd") or ""
+    if not n or not cwd:
+        continue
+    if os.path.normcase(os.path.abspath(cwd)).replace("\\", "/").startswith(wt):
+        print("%s\t%s\t%s" % (n, a.get("agent_status", "unknown"), cwd))' | tr -d '\r'
+}
+
+# done_lanes -- the lanes that look finished by git evidence, not by lifecycle
+# state: settled (idle or done), on a lane branch with commits ahead of
+# origin/main, and a clean tree. `idle` alone is not finished.
+done_lanes() {
+  local n st cwd b ahead
+  git -C "$REPO" fetch -q origin 2>/dev/null
+  lane_agents | while IFS=$'\t' read -r n st cwd; do
+    case "$st" in idle|done) ;; *) echo "skip $n: $st" >&2; continue ;; esac
+    [ -d "$cwd" ] || continue
+    b="$(git -C "$cwd" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+    [ -n "$b" ] && [ "$b" != main ] || continue
+    ahead="$(git -C "$cwd" rev-list --count origin/main..HEAD 2>/dev/null || echo 0)"
+    [ "${ahead:-0}" -gt 0 ] || { echo "skip $n: nothing ahead of origin/main" >&2; continue; }
+    [ "$(content_dirty "$cwd")" = 0 ] || { echo "skip $n: uncommitted changes" >&2; continue; }
+    printf '%s\n' "$n"
+  done
+}
+
+# order_by_overlap <agent>... -- the agents, fewest files shared with the
+# others first, ties by name. The lane that overlaps least is the one whose
+# merge forces the fewest rebases on the rest. Uses the lanes' actual diffs.
+order_by_overlap() {
+  local a d tmp; tmp="$(mktemp)"
+  for a in "$@"; do
+    printf '%s\t\n' "$a" >> "$tmp"
+    d="$(wt_of "$a")"; [ -n "$d" ] && [ -d "$d" ] || continue
+    git -C "$d" diff --name-only origin/main...HEAD 2>/dev/null | awk -v a="$a" '{print a "\t" $0}' >> "$tmp"
+  done
+  python - "$tmp" <<'PY' | tr -d '\r'
+import sys, collections
+files, order = collections.defaultdict(set), []
+for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+    line = line.rstrip("\n")
+    if "\t" not in line: continue
+    a, f = line.split("\t", 1)
+    if a not in order: order.append(a)
+    if f: files[a].add(f)
+def shared(a):
+    return sum(1 for f in files[a] if any(f in files[o] for o in order if o != a))
+for a in sorted(order, key=lambda a: (shared(a), a)):
+    print(a)
+PY
+  rm -f "$tmp"
+}
+
+# land --all [agent...] [--pr|--squash] [--no-review] [--no-merge]
+# `prepare` for every done lane (or the lanes named), then land the ready ones
+# one at a time: in the order given, else fewest shared files first. Each land
+# finds its check and review on file, so it is the push, the PR, CI and the
+# merge; the next lane's rebase then keeps its review by patch-id and, in PR
+# mode, its check too. In squash mode a staged squash must be committed before
+# the next can be staged, so one lane lands per call and the rest are named --
+# their prepared results are on file, so the next call is quick.
+cmd_land_all() {
+  local mode="$LAND_MODE" noreview="" nomerge="" a i
+  local -a names=() ready=() skipped=() landed=() failed=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --pr) mode=pr ;;
+      --squash) mode=squash ;;
+      --no-review) noreview=1 ;;
+      --no-merge) nomerge=1 ;;
+      -*) die "unknown land --all option: $1" ;;
+      *) names+=("$1") ;;
+    esac
+    shift
+  done
+  if [ ${#names[@]} -eq 0 ]; then
+    # while-read rather than mapfile: macOS ships bash 3.2.
+    while IFS= read -r a; do [ -n "$a" ] && names+=("$a"); done < <(done_lanes)
+    [ ${#names[@]} -gt 0 ] || die "land --all: no done lane (settled, ahead of origin/main, clean tree)"
+    local -a ordered=()
+    while IFS= read -r a; do [ -n "$a" ] && ordered+=("$a"); done < <(order_by_overlap "${names[@]}")
+    names=("${ordered[@]}")
+    echo "done lanes, fewest shared files first: ${names[*]}" >&2
+  fi
+  cmd_prepare "--$mode" ${noreview:+--no-review} "${names[@]}" || true
+  for a in "${names[@]}"; do
+    if [ "$(sv "$ARCHIVE/prepare/$a.status" result)" = ready ]; then ready+=("$a"); else skipped+=("$a"); fi
+  done
+  [ ${#skipped[@]} -eq 0 ] || echo "not ready: ${skipped[*]}" >&2
+  [ ${#ready[@]} -gt 0 ] || die "land --all: nothing is ready to land"
+  echo "landing in series: ${ready[*]}"
+  i=0
+  for a in "${ready[@]}"; do
+    if [ "$mode" = squash ] && [ ${#landed[@]} -gt 0 ]; then
+      echo "squash mode: commit the staged squash of '${landed[${#landed[@]}-1]}' first, then: ./.claude/herd.sh land --all ${ready[*]:$i}"
+      break
+    fi
+    echo "== land $a"
+    if ( cmd_land "$a" "--$mode" ${noreview:+--no-review} ${nomerge:+--no-merge} ); then landed+=("$a"); else failed+=("$a"); fi
+    i=$((i + 1))
+  done
+  echo "land --all: landed ${#landed[@]} (${landed[*]:-}) -- failed ${#failed[@]} (${failed[*]:-}) -- not ready ${#skipped[@]} (${skipped[*]:-})"
+  [ ${#failed[@]} -eq 0 ] && [ ${#skipped[@]} -eq 0 ]
 }
 
 # ---------------------------------------------------------------------------
@@ -1586,6 +2164,7 @@ case "${1:-status}" in
   say)    shift; [ $# -ge 1 ] || die "say needs an agent"; cmd_say "$@" ;;
   check)  shift; [ $# -ge 1 ] || die "check needs an agent"; cmd_check "$1" ;;
   review) shift; [ $# -ge 1 ] || die "review needs an agent"; cmd_review "$@" ;;
+  prepare) shift; [ $# -ge 1 ] || die "prepare needs one or more agents"; cmd_prepare "$@" ;;
   document) shift; [ $# -ge 1 ] || die "document needs an agent"; cmd_document "$1" ;;
   pr)     shift; [ $# -ge 1 ] || die "pr needs an agent"; cmd_pr "$@" ;;
   merge)  shift; [ $# -ge 1 ] || die "merge needs an agent"; cmd_merge "$@" ;;
