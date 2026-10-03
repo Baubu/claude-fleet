@@ -146,7 +146,16 @@ Rules that make this worth the minute it costs:
 
 - **Files is exhaustive.** It is how `collisions` derives the shared surface before
   any lane writes a line. A path the lane touches that is not listed is a review
-  finding unless the lane explains it under `## Deviations from plan`.
+  finding unless the lane explains it under `## Deviations from plan`. A bullet may
+  name several paths, comma-separated (`- modify: src/i18n/he.ts, src/i18n/en.ts`);
+  the parser splits them.
+- **Prefer per-area files over shared append-only ones.** Dictionaries (`i18n/en.ts`),
+  route tables, barrel `index.ts` files and seed lists are where parallel lanes
+  actually meet: every lane appends one line to the same file, and every landing
+  after the first rebases on a one-line conflict. Where the repo allows it, plan
+  each lane's additions into a file of its own (a per-feature message file, a
+  per-area route module) and have the shared file import them. Observed on a
+  six-lane fleet: nearly every rebase was the i18n dictionary.
 - **Interfaces are the point.** Parallel lanes merge cleanly when they agree on
   names and signatures up front and disagree on nothing else. Spend the planning
   effort here, not on describing the code body.
@@ -225,13 +234,29 @@ everything that is not.
   has moved the last step back onto them, which is the opposite of the point. The
   gates are the checks you re-ran, the independent review, the closing summary and
   CI. Once those are green, merge — `land` in PR mode does this itself
-  (`AUTO_MERGE=1`), and `merge <agent>` does it for a PR opened earlier. Land lanes
-  of the same repository one at a time, re-running checks after each, so a
-  conflict has one obvious author; lanes of different repositories land in
-  parallel, one land pane per repository, because they share no files and the
-  land is mostly waiting (checks, review, CI). Keep a human gate only on the genuinely irreversible: applying migrations,
-  reseeding live data, spending money, anything that changes what users see. Say
-  what the change will look like to a user before doing it.
+  (`AUTO_MERGE=1`), and `merge <agent>` does it for a PR opened earlier. Merge
+  lanes of the same repository one at a time, so a conflict has one obvious
+  author; lanes of different repositories land in parallel, one land pane per
+  repository. Keep a human gate only on the genuinely irreversible: applying
+  migrations, reseeding live data, spending money, anything that changes what
+  users see. Say what the change will look like to a user before doing it.
+- **Verify in parallel, merge in series, never redo work whose inputs did not
+  change.** Landing used to be serial end to end — check, review, PR, CI, merge,
+  then the next lane's rebase — about fifteen minutes a lane, with the same suite
+  run three times on one commit. Only the merge has to be serial. When several
+  lanes are done, `prepare <agent>...` runs the whole gate (rebase, check, closing
+  summary, plan gap, review) for all of them at once, one line per lane as each
+  finishes, and sends a FIX, a plan gap or a conflict to its lane immediately.
+  `land --all` is `prepare` for every done lane followed by landing the ready ones
+  one at a time, fewest shared files first (or in the order you name them). Every
+  result is filed by what it verified — `checks/<agent>-<sha>.ok|.fail`, the review
+  by commit and by the diff's `git patch-id` — so the `land` that follows finds
+  its check and its review on file and says so, and a clean rebase keeps the
+  review. In PR mode a clean rebase that touched none of the lane's files also
+  keeps the check (`RECHECK_AFTER_REBASE=0`, the PR-mode default): CI on the pull
+  request is the gate for the merged result, and the PR body says so. A conflict,
+  an overlap with the lane's files, or a lockfile change on main always re-runs it;
+  squash mode always re-runs it, since nothing runs after the merge there.
 - **Refill on `done`, not on recycle.** When a lane reports done with a commit and
   a summary, launch the next planned issue into a slot immediately (memory
   permitting) and land the finished lane in parallel; waiting for the merge to
@@ -575,6 +600,25 @@ whose exceptions are swallowed, the symptom is a lie — "no fleet plan on #2" f
 plan that is plainly on the issue. `herd.sh` exports `PYTHONUTF8=1` for every child
 process; do the same in anything you add.
 
+**A rebase can change the dependencies under a lane.** When a sibling lane added a
+package and merged, the next lane's land-time rebase brought in the new
+`package-lock.json`, but its `node_modules` predated it, and the check failed with
+`Cannot find module @vercel/blob` — a failure that was nobody's bug and read like
+one. `land` and `prepare` now watch for a lockfile among the files the rebase
+brought in (`package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, `uv.lock`,
+`Cargo.lock` and friends), re-run the install (`INSTALL_CMD` or toolchain
+detection) and codegen (`CODEGEN_CMD`) in the lane before the check, and say so in
+the gate output, the `prepare` line and the PR body. If you add a lockfile
+convention the list does not know, add it to `rebase_onto_main`.
+
+**Windows Python writes CRLF through a pipe.** `print()` from a Windows Python
+emits `\r\n` even when stdout is a pipe. A `$(...)` substitution happens to drop
+the trailing `\r`, so single-value helpers look fine — but a `while read` loop or
+a per-line `grep -x` over the same output sees `path\r` and never matches. The
+symptom is silent: `land --all` found no done lanes, every path in a plan was
+"unplanned". Every helper in `herd.sh` whose python output is consumed line by
+line pipes it through `tr -d '\r'`; do the same in anything you add.
+
 **Tear the lane down before deleting its branch.** A worktree holds a checkout of
 its branch, so `--delete-branch` on a merge fails while the lane exists. Recycle
 first, then delete.
@@ -620,7 +664,9 @@ rather than pasted.
 
 `herd.sh` provides: `status`, `plan`, `deps`, `collisions`, `launch`, `brief`,
 `watch`, `wait`, `report`, `archive`, `recycle`, `gc`, `resume`, `read`, `say`, `check`,
-`review`, `document`, `pr`, `merge`, `land`. Run it with `help` for usage.
+`review`, `prepare`, `document`, `pr`, `merge`, `land` (and `land --all`). Run it
+with `help` for usage. Check and review results are filed under
+`.claude/fleet-archive/checks/` and `reviews/`; delete a record to force a re-run.
 
 A brand-new worktree is a directory Claude Code has never seen, so the lane's
 first screen is the folder-trust dialog. `launch` answers that one dialog itself —
@@ -640,6 +686,7 @@ agent and `brief <agent>` resends the opening prompt.
 | `LAND_MODE` | `squash` (default) or `pr` |
 | `AUTO_MERGE` | `1` (default): in `pr` mode, wait for CI and merge; the manager merges, not a person |
 | `AUTO_RECYCLE` | `1` (default): after merge, archive the lane and close its worktree and pane |
+| `RECHECK_AFTER_REBASE` | `1`: run the check again after a land-time rebase that was clean and touched none of the lane's files; `0`: keep the pass filed before the rebase and let CI on the PR gate the merged result. Default `0` in `pr` mode, `1` in `squash` mode. A conflict, an overlap, or a lockfile change always re-checks |
 | `REVIEW_MODEL` | model for `review`; default `sonnet` |
 | `STALE_MIN` | idle minutes with no new commit before `watch` says stale; default 30 |
 | `LANE_MODEL`, `LANE_EFFORT` | defaults when neither the plan nor the flags say |

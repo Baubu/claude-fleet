@@ -51,12 +51,14 @@ Requires [Herdr](https://herdr.dev) (`HERDR_ENV=1`) and a git repository.
 ./.claude/herd.sh resume <agent>    # reopen a recycled lane's chat in a new pane, context intact
 ./.claude/herd.sh read <agent> [n]  # last n lines of an agent's transcript
 ./.claude/herd.sh say <agent> <txt> # prompt an agent
-./.claude/herd.sh check <agent>     # lint + test + build that agent's worktree
-./.claude/herd.sh review <agent>    # independent headless review; verdict to the issue
+./.claude/herd.sh check <agent>     # lint + test + build that agent's worktree; the result is filed by commit
+./.claude/herd.sh review <agent>    # independent headless review; verdict to the issue, filed by commit and patch-id
+./.claude/herd.sh prepare <agent>...  # check + review several lanes at once; one line per lane as each finishes
 ./.claude/herd.sh document <agent>  # post the lane's summary to its issue
 ./.claude/herd.sh pr <agent>        # check, review, push, open a PR with evidence, merge when CI is green
 ./.claude/herd.sh merge <agent>     # wait for the PR's checks, squash-merge, update main
 ./.claude/herd.sh land <agent>      # check, review, summary, then squash (or --pr: PR + merge)
+./.claude/herd.sh land --all        # prepare every done lane, then land the ready ones in series
 ```
 
 **The manager merges.** Nothing in the flow ends with "someone please click
@@ -78,15 +80,32 @@ dependency install for every toolchain it detects (npm, uv or venv, wally, cargo
 codegen, the agent started, and an opening brief that names the plan, the shared
 files, and the exact check command to run before reporting done.
 
-`land` runs the checks, then an independent headless review on a cheaper model,
-then requires the lane's closing summary, then stages a squash — or, with
-`LAND_MODE=pr` in `.claude/fleet.conf`, pushes, opens a PR whose body carries the
-summary, the manager's re-run check output and the review verdict, waits for CI,
-and merges it.
+`land` rebases the lane onto main, runs the checks, then an independent headless
+review on a cheaper model, then requires the lane's closing summary, then stages a
+squash — or, with `LAND_MODE=pr` in `.claude/fleet.conf`, pushes, opens a PR whose
+body carries the summary, the manager's check output and the review verdict, waits
+for CI, and merges it.
+
+**Landing is a pipeline: verify in parallel, merge in series, never redo work
+whose inputs did not change.** Every check is filed under
+`.claude/fleet-archive/checks/<agent>-<sha>.ok|.fail` with the tail of its output,
+and every review verdict under `reviews/patch-<patch-id>.verdict` as well as by
+commit. `land` reuses a pass for the commit it is landing and a MERGE for the same
+diff, and says which record it used. `prepare a b c` runs the whole gate for
+several lanes concurrently, printing one line per lane as it finishes (`check PASS
+(ran) -- review MERGE (cached) -- READY`, or the FIX, plan gap or conflict it sent
+to the lane). `land --all` prepares every done lane and then lands the ready ones
+one at a time, fewest shared files first. After a clean rebase that touched none
+of the lane's files, PR mode keeps the review (same patch-id) and the check too
+(`RECHECK_AFTER_REBASE=0`, the PR-mode default — CI on the PR is the gate for the
+merged result, and the PR body says so); a conflict, an overlap, or a lockfile
+change on main always re-runs the check, and a lockfile change first re-runs the
+lane's install and codegen.
 
 `.claude/fleet.conf` keys: `CHECK_CMD`, `INSTALL_CMD`, `CODEGEN_CMD`, `GC_NOTICE_MB`,
-`REQUIRE_PLAN`, `LAND_MODE`, `AUTO_MERGE`, `REVIEW_MODEL`, `STALE_MIN`,
-`LANE_MODEL`, `LANE_EFFORT`. All optional; see the skill for each.
+`REQUIRE_PLAN`, `LAND_MODE`, `AUTO_MERGE`, `AUTO_RECYCLE`, `RECHECK_AFTER_REBASE`,
+`REVIEW_MODEL`, `STALE_MIN`, `LANE_MODEL`, `LANE_EFFORT`. All optional; see the
+skill for each.
 
 ## A typical cycle
 
@@ -135,6 +154,11 @@ Each of these cost real time before it was written down.
   it before any lane starts; without plans, ask each lane to declare the files it
   will touch. Guessing sent three lanes to watch a schema file while they actually
   collided on the seed file.
+- **Plan shared append-only files out of the way.** i18n dictionaries, route tables
+  and barrel files are where parallel lanes meet: each appends a line to the same
+  file, and every landing after the first rebases on a one-line conflict. Where
+  the repo allows it, give each lane a file of its own and have the shared file
+  import them.
 - **Give every lane its own dependency install.** Linking one `node_modules` across
   worktrees fails the moment any lane runs an install, leaving a partial tree that
   breaks lint and test everywhere — silently.
