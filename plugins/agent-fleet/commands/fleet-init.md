@@ -47,6 +47,9 @@ needs something else, write `<repo>/.claude/fleet.conf`:
 CHECK_CMD="<lint + test + build>"        # e.g. uv run ruff check . && uv run mypy pipeline && uv run pytest
 INSTALL_CMD="<dependency install>"       # only if detection is wrong for this repo
 CODEGEN_CMD="<per-worktree codegen>"     # only if the project generates into its dependency tree
+# PRE_MERGE_PATHS="prisma/schema.prisma"  # files whose change needs a step before the merge (globs; a trailing / covers a directory)
+# PRE_MERGE_CMD=""                         # optional: runs in the lane before its merge with FLEET_LANE, FLEET_PR, FLEET_WORKTREE set;
+#                                          # exit 0 satisfies the gate. Without it, a person runs: ./.claude/herd.sh premerge-ok <agent>
 ```
 
 Use `--check-cmd` / `--install-cmd` if the user supplied them. Otherwise infer from
@@ -55,10 +58,17 @@ and state what you chose. Also confirm the toolchain the detection will call is
 actually on PATH (`uv`, `wally`, `cargo`); a missing one makes `launch` refuse,
 which is correct but worth telling the user now.
 
+Ask whether any merge needs a step the plugin cannot do — a production schema
+push, a feature flag, a word with whoever owns the data — and if so, which files
+signal it. Write those as `PRE_MERGE_PATHS` (commented out otherwise): a lane
+touching them is never merged until `PRE_MERGE_CMD` passes or the person runs
+`premerge-ok`, and `prepare` / `land --all` list every such lane together up front.
+
 The other keys are optional and default sensibly; mention them once so the user
 knows they exist: `REQUIRE_PLAN` (1), `LAND_MODE` (`squash` or `pr` — suggest `pr`
-when the repo has CI on a remote), `REVIEW_MODEL` (`sonnet`), `STALE_MIN` (30),
-`LANE_MODEL` / `LANE_EFFORT`.
+when the repo has CI on a remote; in `pr` mode `land --all` lands as a queue, CI
+for every lane at once and merges in series), `REVIEW_MODEL` (`sonnet`),
+`STALE_MIN` (30), `LANE_MODEL` / `LANE_EFFORT`.
 
 ## 4. The guard hook needs no per-project setup
 

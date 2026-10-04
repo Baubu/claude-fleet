@@ -257,6 +257,17 @@ everything that is not.
   request is the gate for the merged result, and the PR body says so. A conflict,
   an overlap with the lane's files, or a lockfile change on main always re-runs it;
   squash mode always re-runs it, since nothing runs after the merge there.
+- **Land PRs as a queue: CI for every ready lane at once, merges one at a time.**
+  In PR mode `land --all` (alias `queue`) opens every READY lane's PR before
+  waiting on any CI, then merges in order on the CI each PR already has, re-running
+  it only where a merge in between touched the lane's files. Three lanes that took
+  three CI waits take one. See "Queue landing" below for the rule and its limits.
+- **A merge that needs a human step waits for it, and all such steps are asked
+  for together.** `PRE_MERGE_PATHS` names the files whose change needs something
+  the plugin cannot do (a production schema push, a flag, a word with the data
+  owner). `prepare` and `land --all` list every lane touching one at the start,
+  in one block; `merge` and `land` stop with exit 15 until `premerge-ok <agent>`
+  or `PRE_MERGE_CMD` has covered the lane's commit. Nothing is merged past it.
 - **Refill on `done`, not on recycle.** When a lane reports done with a commit and
   a summary, launch the next planned issue into a slot immediately (memory
   permitting) and land the finished lane in parallel; waiting for the merge to
@@ -486,6 +497,72 @@ shared state:
   both PR bodies which lands first and why, then rebase the second rather than
   letting a merge queue guess.
 
+## Queue landing
+
+Serial PR landing costs one full CI run per lane, back to back, with the manager
+idle through each: three READY lanes on a repository whose CI takes five minutes
+took fifteen. Opening the three PRs together, so their CI ran at the same time,
+brought that down to one CI run plus seconds per merge. `land --all --pr` (alias
+`queue`) does that:
+
+1. **Open every READY lane's PR without waiting.** Each PR gets the same gate as a
+   single `land --pr --no-merge`: the check and the review on file from `prepare`,
+   the push, the body with the evidence. CI starts for all of them at once.
+2. **Merge in order, fewest shared files first.** For each lane: wait for its
+   checks; if red, send the failure to the lane and move on. Then decide whether
+   the green CI still speaks for what will merge, and either merge on it or
+   re-land (rebase, push, CI again) and then merge.
+
+**When a carried CI pass is acceptable.** The same rule `RECHECK_AFTER_REBASE`
+uses for the local check. A PR's CI ran against main as it was when the PR was
+pushed (its CI base). It still speaks for the merged result when nothing that
+reached main since then can interact with the lane's change: no file merged
+since the CI base is one the lane touches — its plan's Files (a planned
+directory covers everything under it) plus its actual diff — and no lockfile
+changed. Then the lane merges on the CI it has, and the PR gets a comment
+naming the base that CI saw and the PRs that merged after it, so the record
+says what was and was not verified. Otherwise the lane is rebased, pushed and
+CI-gated again, and the per-lane line says why: `rerun: overlaps
+prisma/schema.prisma merged in #12`, or `rerun: lockfile changed`. The re-run
+goes through the normal gate, so an overlap re-runs the local check too, a
+conflict goes to the lane, and the review stays by patch-id.
+
+**The rule is deliberately file-level, not semantic.** Two disjoint files can
+still interact (a renamed export, a changed test fixture). CI on the merged result
+would catch that; a carried pass will not. That is the trade the queue makes,
+and it is the same trade `RECHECK_AFTER_REBASE=0` already makes for the local
+check. Where a repository cannot afford it, `--serial` lands one PR at a time,
+start to finish, as before.
+
+**Branch protection.** If the base branch requires an up-to-date branch before
+merging, the forge reports the PR as `BEHIND` after any other merge, and the
+queue rebases and re-runs every PR after the first, saying that the setting is
+what serialises it. The plugin does not change repository settings: either
+accept the serial cost or relax that rule. GitHub's native merge queue solves
+the same problem on the forge's side; it needs repository settings the plugin
+should not change, so it is not used here.
+
+**The pre-merge gate.** `PRE_MERGE_PATHS` in `fleet.conf` is a space-separated
+list of globs (`prisma/schema.prisma prisma/migrations/`). A lane whose diff
+touches one is never merged until one of:
+
+- `PRE_MERGE_CMD` exits 0. It runs in the lane's worktree with `FLEET_LANE`,
+  `FLEET_PR` and `FLEET_WORKTREE` set, right before the merge; a pass is filed for
+  that commit so it does not run twice.
+- `premerge-ok <agent>` has recorded the step for the lane's current commit. A
+  person runs it after doing the step by hand.
+
+The marker is filed under `.claude/fleet-archive/premerge/<agent>-<sha>.ok`, by
+commit: a new commit on the lane asks again. A rebase the manager made that left
+the gated files byte-identical carries it, so the queue's own re-run does not ask
+twice for the same schema. `merge` and `land` stop with **exit code 15** when the
+step is pending (the other codes: `1` for anything else that stopped a command,
+with the message saying what). `prepare` and `land --all` print every lane that
+needs the step in one block at the start — do them all then, while the gates and
+CI run, rather than one lane at a time as each reaches its merge. The plugin
+surfaces the list and does not try to combine the steps itself; for additive
+steps such as schema pushes, the project may.
+
 ## `idle` does not mean finished
 
 Herdr's `idle` means the agent is ready for input, not that its work is complete.
@@ -664,9 +741,10 @@ rather than pasted.
 
 `herd.sh` provides: `status`, `plan`, `deps`, `collisions`, `launch`, `brief`,
 `watch`, `wait`, `report`, `archive`, `recycle`, `gc`, `resume`, `read`, `say`, `check`,
-`review`, `prepare`, `document`, `pr`, `merge`, `land` (and `land --all`). Run it
-with `help` for usage. Check and review results are filed under
-`.claude/fleet-archive/checks/` and `reviews/`; delete a record to force a re-run.
+`review`, `prepare`, `document`, `pr`, `merge`, `land` (and `land --all`), `queue`,
+`premerge-ok`. Run it with `help` for usage. Check and review results are filed
+under `.claude/fleet-archive/checks/` and `reviews/`, pre-merge steps under
+`premerge/`; delete a record to force a re-run.
 
 A brand-new worktree is a directory Claude Code has never seen, so the lane's
 first screen is the folder-trust dialog. `launch` answers that one dialog itself —
@@ -687,6 +765,8 @@ agent and `brief <agent>` resends the opening prompt.
 | `AUTO_MERGE` | `1` (default): in `pr` mode, wait for CI and merge; the manager merges, not a person |
 | `AUTO_RECYCLE` | `1` (default): after merge, archive the lane and close its worktree and pane |
 | `RECHECK_AFTER_REBASE` | `1`: run the check again after a land-time rebase that was clean and touched none of the lane's files; `0`: keep the pass filed before the rebase and let CI on the PR gate the merged result. Default `0` in `pr` mode, `1` in `squash` mode. A conflict, an overlap, or a lockfile change always re-checks |
+| `PRE_MERGE_PATHS` | space-separated globs (a trailing `/` covers a directory). A lane whose diff touches one is never merged until `PRE_MERGE_CMD` exits 0 or `premerge-ok <agent>` has recorded the step for its commit; `merge`/`land` exit 15 until then. `prepare` and `land --all` list every such lane up front |
+| `PRE_MERGE_CMD` | optional command run in the lane's worktree before its merge, with `FLEET_LANE`, `FLEET_PR`, `FLEET_WORKTREE` set; exit 0 satisfies the gate for that commit |
 | `REVIEW_MODEL` | model for `review`; default `sonnet` |
 | `STALE_MIN` | idle minutes with no new commit before `watch` says stale; default 30 |
 | `LANE_MODEL`, `LANE_EFFORT` | defaults when neither the plan nor the flags say |
