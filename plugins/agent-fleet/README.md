@@ -58,7 +58,9 @@ Requires [Herdr](https://herdr.dev) (`HERDR_ENV=1`) and a git repository.
 ./.claude/herd.sh pr <agent>        # check, review, push, open a PR with evidence, merge when CI is green
 ./.claude/herd.sh merge <agent>     # wait for the PR's checks, squash-merge, update main
 ./.claude/herd.sh land <agent>      # check, review, summary, then squash (or --pr: PR + merge)
-./.claude/herd.sh land --all        # prepare every done lane, then land the ready ones in series
+./.claude/herd.sh land --all        # prepare every done lane, then land the ready ones (PR mode: as a queue; --serial: one at a time)
+./.claude/herd.sh queue [agent...]  # alias for land --all --pr
+./.claude/herd.sh premerge-ok <agent>  # record the project's pre-merge step (PRE_MERGE_PATHS) as done for the lane's commit
 ```
 
 **The manager merges.** Nothing in the flow ends with "someone please click
@@ -102,10 +104,30 @@ merged result, and the PR body says so); a conflict, an overlap, or a lockfile
 change on main always re-runs the check, and a lockfile change first re-runs the
 lane's install and codegen.
 
+**In PR mode the landing is a queue: CI for every ready lane runs at once, and
+the merges happen one at a time.** `land --all --pr` (or `queue`) opens every
+READY lane's PR before waiting on any CI, then walks the lanes in order, fewest
+shared files first. Each lane merges on the green CI it already has when nothing
+merged since that CI ran touches its files (its plan's Files plus its actual
+diff) and no lockfile changed, and the PR gets a comment saying which base that
+CI saw and what merged after it. Otherwise the lane is rebased, pushed and
+CI-gated again, and the per-lane line says why (`rerun: overlaps
+src/x.ts merged in #12`, or `lockfile changed`). A red CI goes to the lane and
+the queue moves on. Three lanes that took three CI waits take one. `--serial`
+lands one PR at a time, as before.
+
+**Some merges need a step the plugin cannot see.** `PRE_MERGE_PATHS` in
+`fleet.conf` names the files (globs) whose change needs it — a production schema
+push before a `prisma/schema.prisma` change auto-deploys, say. A lane whose diff
+touches one is never merged until `PRE_MERGE_CMD` has exited 0 for its commit or
+a person has run `premerge-ok <agent>`; `merge` and `land` stop with exit code
+15 until then. `prepare` and `land --all` list every such lane together, at the
+start, so the steps are done in one go while the gate and CI run.
+
 `.claude/fleet.conf` keys: `CHECK_CMD`, `INSTALL_CMD`, `CODEGEN_CMD`, `GC_NOTICE_MB`,
 `REQUIRE_PLAN`, `LAND_MODE`, `AUTO_MERGE`, `AUTO_RECYCLE`, `RECHECK_AFTER_REBASE`,
-`REVIEW_MODEL`, `STALE_MIN`, `LANE_MODEL`, `LANE_EFFORT`. All optional; see the
-skill for each.
+`PRE_MERGE_PATHS`, `PRE_MERGE_CMD`, `REVIEW_MODEL`, `STALE_MIN`, `LANE_MODEL`,
+`LANE_EFFORT`. All optional; see the skill for each.
 
 ## A typical cycle
 

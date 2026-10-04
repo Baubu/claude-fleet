@@ -32,7 +32,13 @@
 #   ./.claude/herd.sh pr <agent>        # check, review, push, open a PR with evidence, merge when CI is green
 #   ./.claude/herd.sh merge <agent>     # wait for the PR's checks, squash-merge it, update main
 #   ./.claude/herd.sh land <agent> [--pr] [--no-review] [--no-merge]   # check, review, summary, then squash (or PR + merge)
-#   ./.claude/herd.sh land --all [agent...] [--pr] [--no-merge]        # prepare every done lane, then land the ready ones in series
+#   ./.claude/herd.sh land --all [agent...] [--pr] [--no-merge] [--serial]  # prepare every done lane, then land the ready ones: in pr mode as a queue (every PR open at once, CI concurrent, merges in series); --serial lands one PR at a time
+#   ./.claude/herd.sh queue [agent...]  # alias for land --all --pr
+#   ./.claude/herd.sh premerge-ok <agent>  # record that the project's pre-merge step (PRE_MERGE_PATHS) was done for the lane's current commit
+#
+# Exit codes: 0 done; 1 anything that stopped a command (the message says what);
+# 15 from land, pr, merge and land --all: a pre-merge step is pending (PRE_MERGE_PATHS),
+# nothing was merged past it. prepare and land --all exit 1 when any lane was not ready.
 #
 # fleet.conf keys (all optional):
 #   CHECK_CMD      lint + test + build command run inside a lane
@@ -45,6 +51,11 @@
 #   RECHECK_AFTER_REBASE  1: re-run the check after a land-time rebase that was clean and touched none of
 #                  the lane's files; 0: keep the pass filed before the rebase and let CI on the PR gate the
 #                  merged result. Default 0 in pr mode, 1 in squash mode. A conflict or an overlap always re-checks.
+#   PRE_MERGE_PATHS  space-separated globs (e.g. "prisma/schema.prisma prisma/migrations/"). A lane whose diff
+#                  touches one is never merged until PRE_MERGE_CMD exits 0 or `premerge-ok <agent>` has recorded
+#                  the step for the lane's current commit. prepare and land --all list every such lane up front.
+#   PRE_MERGE_CMD  optional command run in the lane's worktree before its merge, with FLEET_LANE, FLEET_PR and
+#                  FLEET_WORKTREE set; exit 0 satisfies the gate for that commit
 #   REVIEW_MODEL   model for `review` (default sonnet)
 #   STALE_MIN      minutes idle with no new commit before `watch` says stale (default 30)
 #   LANE_MODEL / LANE_EFFORT   defaults for launch when the plan and flags say nothing
@@ -88,7 +99,14 @@ load_conf() {
   CHECK_CMD="${CHECK_CMD:-}"
   INSTALL_CMD="${INSTALL_CMD:-}"
   CODEGEN_CMD="${CODEGEN_CMD:-}"
+  PRE_MERGE_PATHS="${PRE_MERGE_PATHS:-}"
+  PRE_MERGE_CMD="${PRE_MERGE_CMD:-}"
 }
+
+# Lockfiles the toolchains write. A change to one on main means the dependencies
+# under a lane moved: the gate reinstalls before its check, and the queue re-runs
+# CI rather than merging on a run that saw the old dependencies.
+LOCKFILE_RE='(^|/)(package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|uv\.lock|poetry\.lock|Pipfile\.lock|Cargo\.lock|wally\.lock|go\.sum)$'
 
 # Resolve an agent name to the worktree path its pane is sitting in.
 wt_of() {
@@ -857,6 +875,201 @@ review_merge_for() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# Pre-merge gate. Some merges need a step the plugin cannot see or do: a
+# production `db push` before a schema change auto-deploys, a feature flag, a
+# word with whoever owns the data. PRE_MERGE_PATHS names the files whose change
+# needs it. A lane whose diff touches one is never merged until PRE_MERGE_CMD
+# has exited 0 for the lane's commit or a person has run `premerge-ok <agent>`
+# for it. The marker is filed by commit, so a new commit asks again; a rebase
+# the manager made that left the gated files byte-identical carries it.
+#
+# Three lanes once changed prisma/schema.prisma in the same week, and each one's
+# push was discovered and requested one lane at a time. `prepare` and
+# `land --all` therefore list every such lane together, at the start, so the
+# steps are done in one go while the gate and CI run.
+# ---------------------------------------------------------------------------
+
+PREMERGE_DIR="$ARCHIVE/premerge"
+# The hit premerge_hits reports when it cannot read the lane's diff at all. It
+# keeps the gate pending (nothing says the gated files are untouched) and
+# neither premerge-ok nor PRE_MERGE_CMD will act on it.
+PREMERGE_UNKNOWN='(cannot list changed files)'
+
+# premerge_hits <worktree> -- the files in the lane's diff that PRE_MERGE_PATHS
+# names, one per line. A glob ending in / covers everything under it.
+# --no-renames: a gated file moved elsewhere is a change to the gated path;
+# rename detection would list only its new name and walk past the gate.
+# quotepath=off: a non-ASCII path must reach the glob as itself.
+# The diff is captured before matching: a diff that fails (no origin/main, a
+# broken worktree) must read as "unknown", never as "nothing gated".
+premerge_hits() {
+  local d="$1" f g out
+  [ -n "$PRE_MERGE_PATHS" ] || return 0
+  if ! out="$(git -C "$d" -c core.quotepath=off diff --no-renames --name-only origin/main...HEAD 2>/dev/null)"; then
+    warn "cannot list the files '$d' changes against origin/main (git diff failed); the pre-merge gate stays pending until it can"
+    printf '%s\n' "$PREMERGE_UNKNOWN"
+    return 0
+  fi
+  printf '%s\n' "$out" | while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    set -f   # the globs are patterns for `case`, not for the file system (this is the pipeline's subshell)
+    # shellcheck disable=SC2254
+    for g in $PRE_MERGE_PATHS; do
+      case "$g" in
+        */) case "$f" in "$g"*) printf '%s\n' "$f"; break ;; esac ;;
+        *)  case "$f" in $g) printf '%s\n' "$f"; break ;; esac ;;
+      esac
+    done
+  done
+}
+
+# premerge_blobs <worktree> <files> -- "blob <id> <path>" for each gated file at
+# HEAD. What the step was done for, byte for byte; a rebase that leaves these
+# alone did not change what the person confirmed.
+premerge_blobs() {
+  local d="$1" f id
+  printf '%s\n' "$2" | while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    id="$(git -C "$d" rev-parse --verify -q "HEAD:$f" 2>/dev/null || echo deleted)"
+    printf 'blob %s %s\n' "$id" "$f"
+  done
+}
+
+# premerge_marker <agent> <worktree> <sha> <by> [carried-from] -- file the step as
+# done for that commit; print the marker's path.
+premerge_marker() {
+  local a="$1" d="$2" sha="$3" by="$4" from="${5:-}" hits f
+  hits="$(premerge_hits "$d")"
+  mkdir -p "$PREMERGE_DIR"
+  f="$PREMERGE_DIR/$a-$sha.ok"
+  {
+    echo "agent: $a"; echo "sha: $sha"; echo "by: $by"
+    [ -n "$from" ] && echo "carried-from: $from"
+    echo "when: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "files: $(printf '%s' "$hits" | tr '\n' ' ' | sed 's/ $//')"
+    premerge_blobs "$d" "$hits"
+  } > "$f"
+  printf '%s' "$f"
+}
+
+# premerge_done_for <agent> <worktree> -- true when the step is on file for the
+# lane's current commit. Sets PREMERGE_HOW ("by <who> @<sha>", with the carry
+# when there was one).
+premerge_done_for() {
+  local a="$1" d="$2" sha f by from
+  PREMERGE_HOW=""
+  sha="$(git -C "$d" rev-parse HEAD 2>/dev/null)"
+  f="$PREMERGE_DIR/$a-$sha.ok"
+  [ -s "$f" ] || return 1
+  by="$(sed -n 's/^by: //p' "$f" | head -1)"; from="$(sed -n 's/^carried-from: //p' "$f" | head -1)"
+  PREMERGE_HOW="by ${by:-?} @${sha:0:7}${from:+, carried from @${from:0:7} over a rebase that left the gated files as they were}"
+  return 0
+}
+
+# premerge_carry <agent> <worktree> -- after a rebase the manager made
+# (REBASED, REBASE_FROM), re-file the marker of the pre-rebase commit under the
+# new one when every gated file is byte-identical to what the step was done
+# for. A lane's own new commit is never carried: that is the person's to look
+# at again.
+premerge_carry() {
+  local a="$1" d="$2" old new hits
+  [ -n "${REBASED:-}" ] && [ -n "${REBASE_FROM:-}" ] || return 0
+  old="$PREMERGE_DIR/$a-$REBASE_FROM.ok"
+  [ -s "$old" ] || return 0
+  new="$(git -C "$d" rev-parse HEAD)"
+  [ -s "$PREMERGE_DIR/$a-$new.ok" ] && return 0
+  hits="$(premerge_hits "$d")"
+  [ -n "$hits" ] || return 0
+  if [ "$(grep '^blob ' "$old")" = "$(premerge_blobs "$d" "$hits")" ]; then
+    premerge_marker "$a" "$d" "$new" "$(sed -n 's/^by: //p' "$old" | head -1)" "$REBASE_FROM" >/dev/null
+    echo "pre-merge step for '$a' carried from @${REBASE_FROM:0:7} to @${new:0:7}: the rebase left $(printf '%s' "$hits" | tr '\n' ' ' | sed 's/ $//') as it was" >&2
+  fi
+  return 0
+}
+
+# premerge_gate <agent> <worktree> [pr-number] -- the merge-time gate. True when
+# the lane touches none of PRE_MERGE_PATHS, the step is on file for its commit,
+# or PRE_MERGE_CMD exits 0 now (which files it). Otherwise says what is pending
+# and returns 15, the exit code `land` and `merge` stop with. Sets
+# PREMERGE_NOTE for the PR comment.
+premerge_gate() {
+  local a="$1" d="$2" pr="${3:-}" hits sha log rc
+  PREMERGE_NOTE=""
+  hits="$(premerge_hits "$d")"
+  [ -n "$hits" ] || return 0
+  local flat; flat="$(printf '%s' "$hits" | tr '\n' ' ' | sed 's/ $//')"
+  case "$hits" in *"$PREMERGE_UNKNOWN"*)
+    warn "pre-merge step for '$a' cannot be judged: the lane's diff against origin/main cannot be read, so whether it touches $PRE_MERGE_PATHS is unknown -- not merging. Fix the worktree (is origin/main there?) and land again"
+    return 15 ;;
+  esac
+  if premerge_done_for "$a" "$d"; then
+    PREMERGE_NOTE="pre-merge step for $flat: $PREMERGE_HOW"
+    echo "pre-merge step for '$a' ($flat): $PREMERGE_HOW" >&2
+    return 0
+  fi
+  sha="$(git -C "$d" rev-parse HEAD)"
+  if [ -n "$PRE_MERGE_CMD" ]; then
+    mkdir -p "$PREMERGE_DIR"; log="$PREMERGE_DIR/$a-${sha:0:7}.log"
+    echo "running PRE_MERGE_CMD for '$a' ($flat): $PRE_MERGE_CMD" >&2
+    ( cd "$d" && export FLEET_LANE="$a" FLEET_PR="$pr" FLEET_WORKTREE="$d" && eval "$PRE_MERGE_CMD" ) > "$log" 2>&1; rc=$?
+    if [ "$rc" = 0 ]; then
+      premerge_marker "$a" "$d" "$sha" PRE_MERGE_CMD >/dev/null
+      PREMERGE_NOTE="pre-merge step for $flat: PRE_MERGE_CMD exited 0 @${sha:0:7}"
+      echo "PRE_MERGE_CMD exited 0 for '$a' @${sha:0:7} (log: $log)" >&2
+      return 0
+    fi
+    warn "PRE_MERGE_CMD exited $rc for '$a' @${sha:0:7} ($flat) -- not merging past it (log: $log). Fix and land again, or do the step by hand and run: ./.claude/herd.sh premerge-ok $a"
+    return 15
+  fi
+  warn "pre-merge step pending for '$a' @${sha:0:7}: its diff touches $flat (PRE_MERGE_PATHS) -- not merging past it. Do the project's pre-merge step, then: ./.claude/herd.sh premerge-ok $a"
+  return 15
+}
+
+# premerge_block <agent>... -- one "human step needed" block for every named
+# lane whose diff touches PRE_MERGE_PATHS and whose step is not on file, so the
+# person handles all of them in one go. Prints nothing when there is none.
+premerge_block() {
+  local a d hits sha lines=""
+  [ -n "$PRE_MERGE_PATHS" ] || return 0
+  for a in "$@"; do
+    d="$(wt_of "$a")"; [ -n "$d" ] && [ -d "$d" ] || continue
+    hits="$(premerge_hits "$d")"; [ -n "$hits" ] || continue
+    premerge_done_for "$a" "$d" && continue
+    sha="$(git -C "$d" rev-parse --short HEAD 2>/dev/null)"
+    lines="$lines   $a @$sha: $(printf '%s' "$hits" | tr '\n' ' ' | sed 's/ $//')
+"
+  done
+  [ -n "$lines" ] || return 0
+  echo "== pre-merge step needed before these lanes can merge (PRE_MERGE_PATHS: $PRE_MERGE_PATHS) -- do them together, now, while the gate and CI run:"
+  printf '%s' "$lines"
+  if [ -n "$PRE_MERGE_CMD" ]; then
+    echo "   PRE_MERGE_CMD runs in each lane before its merge; a step done by hand is recorded with: ./.claude/herd.sh premerge-ok <agent>"
+  else
+    echo "   when a lane's step is done: ./.claude/herd.sh premerge-ok <agent>   (a new commit on the lane asks again)"
+  fi
+}
+
+# premerge-ok <agent> -- record the project's pre-merge step as done for the
+# lane's current commit.
+cmd_premerge_ok() {
+  local a="$1" d sha hits f
+  [ -n "$PRE_MERGE_PATHS" ] || die "PRE_MERGE_PATHS is not set in .claude/fleet.conf; no merge is gated"
+  d="$(wt_of "$a")"; [ -n "$d" ] && [ -d "$d" ] || die "no worktree for agent '$a'"
+  hits="$(premerge_hits "$d")"
+  if [ -z "$hits" ]; then
+    echo "'$a' touches none of PRE_MERGE_PATHS ($PRE_MERGE_PATHS); nothing to record"
+    return 0
+  fi
+  case "$hits" in *"$PREMERGE_UNKNOWN"*)
+    die "cannot tell which files '$a' changes (its diff against origin/main cannot be read); not recording a step for an unknown set of files. Fix the worktree (is origin/main there?) and try again" ;;
+  esac
+  sha="$(git -C "$d" rev-parse HEAD)"
+  f="$(premerge_marker "$a" "$d" "$sha" human)"
+  echo "pre-merge step recorded for $a @${sha:0:7} ($(printf '%s' "$hits" | tr '\n' ' ' | sed 's/ $//')) -> $f"
+  echo "a new commit on the lane asks again; a rebase by the manager that leaves these files as they are carries it"
+}
+
 # check <agent> -- run the lint+test+build command in the lane and file the
 # outcome under checks/<agent>-<sha>.ok|.fail with the tail of its output. It
 # always runs; `land` and `prepare` are what consult the record. The outcome
@@ -1221,9 +1434,7 @@ rebase_onto_main() {
     # live: a sibling lane added a package, and the next lane's check failed
     # with "Cannot find module" for a reason that had nothing to do with its
     # work. The gate reinstalls before checking when this is set.
-    REBASE_LOCKFILE="$(printf '%s\n' "$changed" \
-      | grep -E '(^|/)(package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|uv\.lock|poetry\.lock|Pipfile\.lock|Cargo\.lock|wally\.lock|go\.sum)$' \
-      | tr '\n' ' ' | sed 's/ $//')"
+    REBASE_LOCKFILE="$(printf '%s\n' "$changed" | grep -E "$LOCKFILE_RE" | tr '\n' ' ' | sed 's/ $//')"
     return 0
   fi
   conflicts="$(git -C "$d" diff --name-only --diff-filter=U | tr '\n' ' ')"
@@ -1248,6 +1459,9 @@ gate_note() {
 # code `prepare` can name:
 #   10 on main or dirty   11 rebase conflict   12 checks failed
 #   13 no summary         14 plan gap          15 review FIX   16 ESCALATE or no verdict
+# These are the gate's own, read by `prepare` and turned into exit 1 by `land`;
+# none leaves the process. The process exit code 15 (pre-merge step pending,
+# see the header) is unrelated to the gate's 15.
 # Leaves, for the PR body: GATE_SHA, GATE_CHECK_NOTE, GATE_CHECK_FILE,
 # GATE_CHECK_CARRIED, GATE_REVIEW_NOTE, GATE_REVIEW_VERDICT, GATE_REVIEW_FILE.
 gate_for_landing() {
@@ -1261,6 +1475,16 @@ gate_for_landing() {
   rebase_onto_main "$a" "$d" "$b" || { gate_note result conflict; return 11; }
   sha="$(git -C "$d" rev-parse HEAD)"; short="$(git -C "$d" rev-parse --short HEAD)"
   GATE_SHA="$sha"; gate_note sha "$short"
+
+  # The pre-merge step is not a gate here -- the lane is still READY, its PR
+  # can open and its CI can run while a person does the step -- but a rebase
+  # must not lose a step already done, and `prepare` says who still needs one.
+  local hits; hits="$(premerge_hits "$d")"
+  if [ -n "$hits" ]; then
+    premerge_carry "$a" "$d"
+    if premerge_done_for "$a" "$d"; then gate_note premerge "done"
+    else gate_note premerge "pending: $(printf '%s' "$hits" | tr '\n' ' ' | sed 's/ $//')"; fi
+  fi
 
   # Dependencies. A rebase that brought in a lockfile change leaves the lane's
   # install behind it, and the check then fails on a missing module that is
@@ -1386,8 +1610,53 @@ gate_for_landing() {
   return 0
 }
 
+# wait_for_checks <pr-number> -- block until the PR's checks settle. Returns 0
+# green, 1 a check failed, 2 the PR has no checks. Sets WAIT_NCHECKS.
+wait_for_checks() {
+  local n="$1" t rc
+  WAIT_NCHECKS="$(ghr pr checks "$n" --json name -q 'length' 2>/dev/null || echo 0)"
+  # CI registers its checks a few seconds after the push. Do not mistake that
+  # gap for "this repository has no CI": poll for up to 90 s first.
+  for t in $(seq 1 9); do
+    [ "${WAIT_NCHECKS:-0}" -gt 0 ] && break
+    sleep 10
+    WAIT_NCHECKS="$(ghr pr checks "$n" --json name -q 'length' 2>/dev/null || echo 0)"
+  done
+  [ "${WAIT_NCHECKS:-0}" -gt 0 ] || return 2
+  echo "waiting for $WAIT_NCHECKS check(s) on #$n..." >&2
+  ghr pr checks "$n" --watch --fail-fast >/dev/null 2>&1; rc=$?
+  [ $rc -eq 0 ] || return 1
+  return 0
+}
+
+# ci_failure_to_lane <agent> <branch> <pr-number> -- hand a red CI to the lane
+# that wrote the code, naming the checks that failed, as the gate does for a
+# conflict or a FIX.
+ci_failure_to_lane() {
+  local a="$1" b="$2" n="$3" names
+  names="$(ghr pr checks "$n" --json name,state -q '.[] | select(.state != "SUCCESS" and .state != "SKIPPED" and .state != "NEUTRAL") | .name' 2>/dev/null | tr -d '\r' | tr '\n' ' ' | sed 's/ $//')"
+  herdr agent prompt "$a" "CI failed on pull request #$n for your branch $b${names:+ (failing: $names)}. Run 'gh pr checks $n' and read the failing job's log, fix the cause, commit, re-run the project's checks locally, update .claude/lane-summary.md, and report what you changed. Do not push; the manager re-lands your branch." >/dev/null 2>&1 \
+    || warn "could not prompt '$a' with the CI failure"
+}
+
+# no_ci_merge_check <agent> <branch> <pr-number> -- what stands in for CI on a
+# PR that has none. A pass carried over the rebase was carried on the strength
+# of CI running on the merged result; with no CI, run the check on the rebased
+# branch now rather than merge something nothing has seen.
+no_ci_merge_check() {
+  local a="$1" b="$2" n="$3"
+  if [ -n "${GATE_CHECK_CARRIED:-}" ]; then
+    warn "#$n has no CI checks and the local pass was carried over the rebase; running the check on the rebased branch now"
+    cmd_check "$a" || return 1
+  else
+    warn "#$n has no CI checks; merging on the manager's local verification and the review"
+  fi
+  return 0
+}
+
 # merge <agent> [--no-wait] -- wait for the lane's PR checks, squash-merge it,
-# and fast-forward the manager's main checkout.
+# and fast-forward the manager's main checkout. Exit 15 when the pre-merge step
+# (PRE_MERGE_PATHS) is pending; nothing is merged past it.
 #
 # The manager merges. Landing that stops at "PR open, someone please click" has
 # moved the last step back onto the person, which is the opposite of the point.
@@ -1396,35 +1665,31 @@ gate_for_landing() {
 cmd_merge() {
   local a="$1"; shift
   local nowait=""; [ "${1:-}" = "--no-wait" ] && nowait=1
-  local d b n rc nchecks
+  local d b n rc
   d="$(wt_of "$a")"; [ -n "$d" ] && [ -d "$d" ] || die "no worktree for agent '$a'"
   b="$(git -C "$d" rev-parse --abbrev-ref HEAD)"
   command -v gh >/dev/null 2>&1 || die "gh is not available"
   n="$(ghr pr list --head "$b" --state open --json number -q '.[0].number' 2>/dev/null)"
   [ -n "$n" ] || die "no open PR for '$b' (open one with: ./.claude/herd.sh pr $a)"
+  # What merges is the PR's head. The gate, the CI and any pre-merge marker
+  # speak for the lane's HEAD; if the two differ, nothing here has seen what
+  # would merge.
+  local remote_head local_head
+  remote_head="$(ghr pr view "$n" --json headRefOid -q .headRefOid 2>/dev/null | tr -d '\r')"
+  local_head="$(git -C "$d" rev-parse HEAD 2>/dev/null)"
+  if [ -n "$remote_head" ] && [ "$remote_head" != "$local_head" ]; then
+    die "#$n's head is @${remote_head:0:7} but '$a' is at @${local_head:0:7} -- not merging what the gate did not see; land again (./.claude/herd.sh land $a --pr) to push and re-verify"
+  fi
+  # The pre-merge step first: a person finds out now, not after the CI wait.
+  premerge_gate "$a" "$d" "$n" || return 15
   if [ -z "$nowait" ]; then
-    nchecks="$(ghr pr checks "$n" --json name -q 'length' 2>/dev/null || echo 0)"
-    # CI registers its checks a few seconds after the push. Do not mistake that
-    # gap for "this repository has no CI": poll for up to 90 s first.
-    local t
-    for t in $(seq 1 9); do
-      [ "${nchecks:-0}" -gt 0 ] && break
-      sleep 10
-      nchecks="$(ghr pr checks "$n" --json name -q 'length' 2>/dev/null || echo 0)"
-    done
-    if [ "${nchecks:-0}" -gt 0 ]; then
-      echo "waiting for $nchecks check(s) on #$n..." >&2
-      ghr pr checks "$n" --watch --fail-fast >/dev/null 2>&1; rc=$?
-      [ $rc -eq 0 ] || die "checks failed on #$n -- not merging (gh pr checks $n); send the failure to the lane and land again"
-    elif [ -n "${GATE_CHECK_CARRIED:-}" ]; then
-      # The pass was carried over the rebase on the strength of CI running on
-      # the merged result. There is no CI, so the merged result has never been
-      # checked: run it now rather than merge something nothing has seen.
-      warn "#$n has no CI checks and the local pass was carried over the rebase; running the check on the rebased branch now"
-      cmd_check "$a" || die "checks failed on the rebased '$b' -- not merging; send the failure to the lane and land again"
-    else
-      warn "#$n has no CI checks; merging on the manager's local verification and the review"
-    fi
+    wait_for_checks "$n"; rc=$?
+    case $rc in
+      0) ;;
+      1) ci_failure_to_lane "$a" "$b" "$n"
+         die "checks failed on #$n -- not merging (gh pr checks $n); the failure was sent to the lane, land again when it reports done" ;;
+      *) no_ci_merge_check "$a" "$b" "$n" || die "checks failed on the rebased '$b' -- not merging; send the failure to the lane and land again" ;;
+    esac
   fi
   ghr pr merge "$n" --squash >/dev/null 2>&1 || die "gh pr merge #$n failed -- branch protection or a conflict; see: gh pr view $n"
   if [ "$(git -C "$REPO" rev-parse --abbrev-ref HEAD)" = main ] && [ "$(content_dirty "$REPO")" = 0 ]; then
@@ -1546,6 +1811,7 @@ cmd_land() {
   git -C "$REPO" rev-parse --abbrev-ref HEAD | grep -qx main || die "manager checkout is not on main"
   [ "$(content_dirty "$REPO")" = 0 ] || die "main checkout has uncommitted content changes"
   gate_for_landing "$a" "$d" "$b" "$noreview" squash || exit 1
+  premerge_gate "$a" "$d" || return 15
   git -C "$REPO" merge --squash "$b" || die "squash merge hit conflicts -- resolve in the main checkout"
   echo "Staged squash of '$b'. Review with: git -C \"$REPO\" diff --cached"
   echo "Then commit, and post the summary to the issue with:"
@@ -1586,6 +1852,9 @@ cmd_prepare() {
   done
   [ ${#names[@]} -gt 0 ] || die "prepare needs one or more agents"
   mkdir -p "$ARCHIVE/prepare"
+  # Every lane that needs the project's pre-merge step, in one block, before
+  # anything waits: the person does them together while the gates run.
+  premerge_block "${names[@]}"
   echo "preparing ${#names[@]} lane(s) in parallel ($mode mode); logs in $ARCHIVE/prepare/" >&2
   # One fetch for all lanes. The worktrees share .git, and several concurrent
   # fetches contend for its lock; the gates below skip their own fetch.
@@ -1622,9 +1891,10 @@ prepare_one() {
 # prepare_line <agent> <status-file> <log> -- "prepare <agent> @sha: check PASS
 # (cached) -- review MERGE (cached) -- READY", or where it stopped and why.
 prepare_line() {
-  local a="$1" st="$2" log="$3" sha res check review detail rc stage head out install
+  local a="$1" st="$2" log="$3" sha res check review detail rc stage head out install premerge
   sha="$(sv "$st" sha)"; res="$(sv "$st" result)"; check="$(sv "$st" check)"; install="$(sv "$st" install)"
   review="$(sv "$st" review)"; detail="$(sv "$st" detail)"; rc="$(sv "$st" rc)"; stage="$(sv "$st" stage)"
+  premerge="$(sv "$st" premerge)"
   head="prepare $a${sha:+ @$sha}:"
   out=""
   [ -n "$install" ] && out="deps reinstalled ($install changed on main)"
@@ -1641,7 +1911,11 @@ prepare_line() {
     *) out="${out:+$out -- }review $review" ;;
   esac
   case "$res" in
-    ready)        out="$out -- READY" ;;
+    ready)        out="$out -- READY"
+                  case "$premerge" in
+                    pending:*) out="$out -- pre-merge step PENDING (${premerge#pending: })" ;;
+                    done)      out="$out -- pre-merge step done" ;;
+                  esac ;;
     main)         out="on main -- refusing" ;;
     dirty)        out="DIRTY (uncommitted changes)" ;;
     conflict)     out="rebase CONFLICT -- sent to the lane (log: $log)" ;;
@@ -1721,16 +1995,20 @@ PY
   rm -f "$tmp"
 }
 
-# land --all [agent...] [--pr|--squash] [--no-review] [--no-merge]
-# `prepare` for every done lane (or the lanes named), then land the ready ones
-# one at a time: in the order given, else fewest shared files first. Each land
-# finds its check and review on file, so it is the push, the PR, CI and the
-# merge; the next lane's rebase then keeps its review by patch-id and, in PR
-# mode, its check too. In squash mode a staged squash must be committed before
-# the next can be staged, so one lane lands per call and the rest are named --
-# their prepared results are on file, so the next call is quick.
+# land --all [agent...] [--pr|--squash] [--no-review] [--no-merge] [--serial]
+# `prepare` for every done lane (or the lanes named), then land the ready ones:
+# in the order given, else fewest shared files first. Each land finds its check
+# and review on file, so it is the push, the PR, CI and the merge.
+#
+# In PR mode the landing is a queue (land_queue below): every PR opens before
+# any CI wait, so CI runs for all of them at once, and the merges happen one at
+# a time on the CI each PR already has unless something merged in between
+# touched its files. --serial lands one PR at a time, start to finish, as 1.6.0
+# did. In squash mode a staged squash must be committed before the next can be
+# staged, so one lane lands per call and the rest are named -- their prepared
+# results are on file, so the next call is quick.
 cmd_land_all() {
-  local mode="$LAND_MODE" noreview="" nomerge="" a i
+  local mode="$LAND_MODE" noreview="" nomerge="" serial="" a i
   local -a names=() ready=() skipped=() landed=() failed=()
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1738,6 +2016,7 @@ cmd_land_all() {
       --squash) mode=squash ;;
       --no-review) noreview=1 ;;
       --no-merge) nomerge=1 ;;
+      --serial) serial=1 ;;
       -*) die "unknown land --all option: $1" ;;
       *) names+=("$1") ;;
     esac
@@ -1758,7 +2037,14 @@ cmd_land_all() {
   done
   [ ${#skipped[@]} -eq 0 ] || echo "not ready: ${skipped[*]}" >&2
   [ ${#ready[@]} -gt 0 ] || die "land --all: nothing is ready to land"
+  if [ "$mode" = pr ] && [ -z "$serial" ]; then
+    land_queue "$noreview" "$nomerge" "${ready[@]}"; local qrc=$?
+    echo "land --all: landed ${#QUEUE_LANDED[@]} (${QUEUE_LANDED[*]:-}) -- failed ${#QUEUE_FAILED[@]} (${QUEUE_FAILED[*]:-}) -- pre-merge step pending ${#QUEUE_PENDING[@]} (${QUEUE_PENDING[*]:-}) -- not ready ${#skipped[@]} (${skipped[*]:-})"
+    [ ${#skipped[@]} -eq 0 ] || return 1
+    return $qrc
+  fi
   echo "landing in series: ${ready[*]}"
+  local -a pending=()
   i=0
   for a in "${ready[@]}"; do
     if [ "$mode" = squash ] && [ ${#landed[@]} -gt 0 ]; then
@@ -1766,11 +2052,220 @@ cmd_land_all() {
       break
     fi
     echo "== land $a"
-    if ( cmd_land "$a" "--$mode" ${noreview:+--no-review} ${nomerge:+--no-merge} ); then landed+=("$a"); else failed+=("$a"); fi
+    ( cmd_land "$a" "--$mode" ${noreview:+--no-review} ${nomerge:+--no-merge} ); local rc=$?
+    case $rc in 0) landed+=("$a") ;; 15) pending+=("$a") ;; *) failed+=("$a") ;; esac
     i=$((i + 1))
   done
-  echo "land --all: landed ${#landed[@]} (${landed[*]:-}) -- failed ${#failed[@]} (${failed[*]:-}) -- not ready ${#skipped[@]} (${skipped[*]:-})"
-  [ ${#failed[@]} -eq 0 ] && [ ${#skipped[@]} -eq 0 ]
+  echo "land --all: landed ${#landed[@]} (${landed[*]:-}) -- failed ${#failed[@]} (${failed[*]:-}) -- pre-merge step pending ${#pending[@]} (${pending[*]:-}) -- not ready ${#skipped[@]} (${skipped[*]:-})"
+  [ ${#failed[@]} -eq 0 ] && [ ${#skipped[@]} -eq 0 ] || return 1
+  [ ${#pending[@]} -eq 0 ] || return 15
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# The queue. Three lanes were READY at once on a repository whose CI takes
+# five minutes, and landing them in series was three CI waits back to back,
+# with the manager idle through each. Opening the three PRs by hand, so their
+# CI ran together, brought that down to one CI run plus seconds per merge.
+#
+# Phase 1 opens (or updates) every READY lane's PR without waiting. Phase 2
+# walks the lanes in order and, for each: waits for its checks; decides
+# whether that CI still speaks for the merged result, by the rule
+# RECHECK_AFTER_REBASE uses -- it does unless a file merged since the PR's CI
+# base is one the lane touches (its plan's Files plus its actual diff) or a
+# lockfile; merges on the green CI it has, saying so on the PR, or re-lands
+# (rebase, push, CI again) when it does not. A red CI goes to the lane and the
+# queue moves on. The pre-merge gate is checked before any re-run, so a lane
+# waiting on a person costs no CI.
+#
+# Branch protection that requires an up-to-date branch (the PR reports
+# mergeStateStatus BEHIND) forces the rebase and the re-run for every PR after
+# the first; the queue says so, since that setting is what serialises it.
+# ---------------------------------------------------------------------------
+
+# queue_record <agent> <key> <value> -- queue state, next to the prepare status.
+queue_record() { printf '%s\t%s\n' "$2" "$3" >> "$ARCHIVE/prepare/$1.status"; }
+
+# queue_prs_since <log> <from-index> -- "#n, #m" for the PRs this queue merged
+# from the given log line on.
+queue_prs_since() {
+  awk -F'\t' -v from="$2" 'NR > from {printf "%s#%s", (n++ ? ", " : ""), $3} END {print ""}' "$1"
+}
+
+# queue_prs_touching <log> <from-index> <files> -- "#n" for every PR this queue
+# merged from the given log line on whose diff touched one of the files.
+queue_prs_touching() {
+  local log="$1" from="$2" files="$3" before after n out=""
+  tail -n +"$((from + 1))" "$log" | while IFS=$'\t' read -r before after n; do
+    if git -C "$REPO" diff --name-only "$before" "$after" 2>/dev/null | grep -qxF -f <(printf '%s\n' "$files"); then
+      printf '#%s\n' "$n"
+    fi
+  done | tr '\n' ' ' | sed 's/ $//'
+}
+
+# queue_stale_reason <agent> <worktree> <pr> <ci-base> <log> <from-index> --
+# why the lane's CI no longer speaks for the merged result, or nothing. The
+# lane's files are its plan's Files (a planned directory covers everything
+# under it) plus its actual diff.
+queue_stale_reason() {
+  local a="$1" d="$2" n="$3" base="$4" log="$5" from="$6" st changed mine overlap lock dir issue
+  # Fail closed. Only a comparison that ran and found nothing lets the CI stand:
+  # no base on record, or a diff that failed (an unreachable commit, a broken
+  # checkout), is a reason to re-run, not a licence to merge.
+  if [ -z "$base" ]; then
+    echo "no CI base on record for #$n; re-running rather than trusting the CI it had"
+    return 0
+  fi
+  st="$(ghr pr view "$n" --json mergeStateStatus -q .mergeStateStatus 2>/dev/null | tr -d '\r')"
+  if [ "$st" = BEHIND ]; then
+    echo "branch protection requires an up-to-date branch (mergeStateStatus BEHIND); that setting serialises the queue"
+    return 0
+  fi
+  # --no-renames: a file moved out of a path is a change to that path on both
+  # sides of the comparison, and rename detection would list only the new name.
+  # quotepath=off: a non-ASCII name must compare as itself, not as its escape.
+  if ! changed="$(git -C "$REPO" -c core.quotepath=off diff --no-renames --name-only "$base" origin/main 2>/dev/null)"; then
+    echo "cannot compare @${base:0:7} with origin/main (git diff failed); re-running rather than trusting the CI it had"
+    return 0
+  fi
+  changed="$(printf '%s\n' "$changed" | grep . | sort -u)"
+  [ -n "$changed" ] || return 0
+  issue="$(issue_of_branch "$(git -C "$d" rev-parse --abbrev-ref HEAD)")"
+  mine="$( { git -C "$d" -c core.quotepath=off diff --no-renames --name-only origin/main...HEAD 2>/dev/null; plan_files "${issue:-0}"; } | grep -v '/$' | sort -u)"
+  overlap="$(comm -12 <(printf '%s\n' "$changed") <(printf '%s\n' "$mine"))"
+  # A planned directory covers every merged file under it.
+  while IFS= read -r dir; do
+    [ -n "$dir" ] || continue
+    overlap="$(printf '%s\n' "$overlap" "$(printf '%s\n' "$changed" | awk -v p="$dir" 'index($0, p) == 1')" | grep . | sort -u)"
+  done < <(plan_files "${issue:-0}" | grep -E '/$')
+  local by
+  if [ -n "$overlap" ]; then
+    by="$(queue_prs_touching "$log" "$from" "$overlap")"
+    echo "overlaps $(printf '%s' "$overlap" | tr '\n' ' ' | sed 's/ $//') merged in ${by:-main outside this queue}"
+    return 0
+  fi
+  lock="$(printf '%s\n' "$changed" | grep -E "$LOCKFILE_RE")"
+  if [ -n "$lock" ]; then
+    by="$(queue_prs_touching "$log" "$from" "$lock")"
+    echo "lockfile changed ($(printf '%s' "$lock" | tr '\n' ' ' | sed 's/ $//')) in ${by:-main outside this queue}"
+    return 0
+  fi
+  return 0
+}
+
+# queue_open <agent> <noreview> -- phase 1 for one lane: the gate (on file),
+# the push, the PR. Records the PR number and the CI base: main as the lane
+# saw it when its CI started. Returns the land's code.
+queue_open() {
+  local a="$1" noreview="$2" d b n base rc
+  ( cmd_land "$a" --pr ${noreview:+--no-review} --no-merge ); rc=$?
+  [ $rc -eq 0 ] || return $rc
+  d="$(wt_of "$a")"; b="$(git -C "$d" rev-parse --abbrev-ref HEAD)"
+  n="$(ghr pr list --head "$b" --state open --json number -q '.[0].number' 2>/dev/null | tr -d '\r')"
+  [ -n "$n" ] || { warn "no open PR for '$b' after land --no-merge"; return 1; }
+  base="$(git -C "$d" merge-base HEAD origin/main 2>/dev/null)"
+  # No base, no queue: phase 2 could not tell what this lane's CI missed.
+  [ -n "$base" ] || { warn "cannot find the merge base of '$b' and origin/main; not queueing '$a'"; return 1; }
+  queue_record "$a" pr "$n"; queue_record "$a" cibase "$base"
+  QUEUE_PR="$n"
+  return 0
+}
+
+# land_queue <noreview> <nomerge> <agent>... -- see the section comment. Leaves
+# QUEUE_LANDED, QUEUE_FAILED and QUEUE_PENDING; returns 0 when every lane
+# merged, 15 when the only lanes left are waiting on a pre-merge step, else 1.
+land_queue() {
+  local noreview="$1" nomerge="$2"; shift 2
+  local a d b n base before after reason rc carried since log
+  local -a queued=() prs=()
+  QUEUE_LANDED=(); QUEUE_FAILED=(); QUEUE_PENDING=()
+  echo "queue: opening $# pull request(s) before any CI wait: $*"
+  for a in "$@"; do
+    echo "== pr $a"
+    if queue_open "$a" "$noreview"; then queued+=("$a"); prs+=("$QUEUE_PR"); else QUEUE_FAILED+=("$a"); fi
+  done
+  if [ -n "$nomerge" ] || [ "$AUTO_MERGE" != 1 ]; then
+    [ -n "$nomerge" ] || echo "AUTO_MERGE=0: the PRs are open and their CI is running; merge each with: ./.claude/herd.sh merge <agent>"
+    [ ${#QUEUE_FAILED[@]} -eq 0 ] && return 0 || return 1
+  fi
+  [ ${#queued[@]} -gt 0 ] || return 1
+  # The PRs this queue merged, in order: before, after (main), number. What
+  # a later lane's CI missed is read from here.
+  log="$(mktemp)"
+  echo "queue: merging in order: ${queued[*]} (their CI runs concurrently)"
+  local i=0
+  for a in "${queued[@]}"; do
+    n="${prs[$i]}"; i=$((i + 1))
+    d="$(wt_of "$a")"; b="$(git -C "$d" rev-parse --abbrev-ref HEAD)"
+    base="$(sv "$ARCHIVE/prepare/$a.status" cibase)"; since=0
+    carried=""; [ "$(sv "$ARCHIVE/prepare/$a.status" check)" = "PASS carried" ] && carried=1
+    echo "== merge $a (#$n)"
+    wait_for_checks "$n"; rc=$?
+    if [ $rc = 1 ]; then
+      ci_failure_to_lane "$a" "$b" "$n"
+      echo "queue $a #$n: CI FAILED -- sent to the lane; the queue moves on"
+      QUEUE_FAILED+=("$a"); continue
+    fi
+    # The pre-merge step, before any re-run: a lane waiting on a person must
+    # not cost a CI run, and the person may still do the step while the queue
+    # waits on the next lane.
+    if ! premerge_gate "$a" "$d" "$n"; then
+      echo "queue $a #$n: pre-merge step PENDING -- exit 15 from merge; the queue moves on"
+      QUEUE_PENDING+=("$a"); continue
+    fi
+    # Without a fetch there is no telling what merged since the CI ran: fail
+    # closed and re-run rather than merge on origin/main as it was on disk.
+    if git -C "$REPO" fetch -q origin 2>/dev/null; then
+      reason="$(queue_stale_reason "$a" "$d" "$n" "$base" "$log" "$since")"
+    else
+      reason="git fetch origin failed; cannot tell what merged since the CI ran, so it is not trusted"
+    fi
+    if [ -n "$reason" ]; then
+      echo "queue $a #$n: rerun: $reason"
+      # The land re-runs the gate: the rebase (a conflict goes to the lane),
+      # the check where the overlap or the lockfile demands it, the review by
+      # patch-id, the push, the PR body. Then CI again on the rebased branch.
+      if ! queue_open "$a" "$noreview"; then
+        echo "queue $a #$n: re-land FAILED (see above); the queue moves on"
+        QUEUE_FAILED+=("$a"); continue
+      fi
+      n="$QUEUE_PR"; since="$(wc -l < "$log" | tr -d ' ')"
+      carried=""; [ "$(sv "$ARCHIVE/prepare/$a.status" check)" = "PASS carried" ] && carried=1
+      wait_for_checks "$n"; rc=$?
+      if [ $rc = 1 ]; then
+        ci_failure_to_lane "$a" "$b" "$n"
+        echo "queue $a #$n: CI FAILED after the re-run -- sent to the lane; the queue moves on"
+        QUEUE_FAILED+=("$a"); continue
+      fi
+    fi
+    if [ $rc = 2 ] && ! ( GATE_CHECK_CARRIED="$carried" no_ci_merge_check "$a" "$b" "$n" ); then
+      echo "queue $a #$n: check FAILED on the rebased branch (no CI on the PR); the queue moves on"
+      QUEUE_FAILED+=("$a"); continue
+    fi
+    before="$(git -C "$REPO" rev-parse origin/main 2>/dev/null)"
+    # What this queue merged since the lane's CI ran, for the PR comment.
+    local merged_since; merged_since="$(queue_prs_since "$log" "$since")"
+    ( cmd_merge "$a" --no-wait ); rc=$?
+    case $rc in
+      0) git -C "$REPO" fetch -q origin 2>/dev/null || warn "git fetch origin failed after merging #$n; the next lane fetches again before it is judged"
+         after="$(git -C "$REPO" rev-parse origin/main 2>/dev/null)"
+         printf '%s\t%s\t%s\n' "$before" "$after" "$n" >> "$log"
+         if [ -z "$reason" ] && [ -n "$merged_since" ]; then
+           # Merged on the CI it had: say what that CI saw and what it did not.
+           ghr pr comment "$n" --body "CI ran against \`${base:0:7}\` (main at the time); merged after $merged_since: no shared files and no lockfile change, so that run speaks for the merged result (herd.sh queue).${PREMERGE_NOTE:+ $PREMERGE_NOTE.}" >/dev/null 2>&1 || true
+           echo "queue $a #$n: MERGED on the CI it had (ran against @${base:0:7}; no shared files with $merged_since)"
+         else
+           echo "queue $a #$n: MERGED${reason:+ after the re-run}"
+         fi
+         QUEUE_LANDED+=("$a") ;;
+      15) echo "queue $a #$n: pre-merge step PENDING -- exit 15 from merge; the queue moves on"; QUEUE_PENDING+=("$a") ;;
+      *)  echo "queue $a #$n: merge FAILED (see above); the queue moves on"; QUEUE_FAILED+=("$a") ;;
+    esac
+  done
+  rm -f "$log"
+  [ ${#QUEUE_FAILED[@]} -eq 0 ] || return 1
+  [ ${#QUEUE_PENDING[@]} -eq 0 ] || return 15
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -2169,6 +2664,8 @@ case "${1:-status}" in
   pr)     shift; [ $# -ge 1 ] || die "pr needs an agent"; cmd_pr "$@" ;;
   merge)  shift; [ $# -ge 1 ] || die "merge needs an agent"; cmd_merge "$@" ;;
   land)   shift; [ $# -ge 1 ] || die "land needs an agent"; cmd_land "$@" ;;
+  queue)  shift; cmd_land_all --pr "$@" ;;
+  premerge-ok) shift; [ $# -ge 1 ] || die "premerge-ok needs an agent"; cmd_premerge_ok "$1" ;;
   -h|--help|help) usage ;;
   *)      die "unknown command '$1'"; ;;
 esac
